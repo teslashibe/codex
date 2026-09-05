@@ -98,7 +98,7 @@ func (c *Client) Run(ctx context.Context, sessionID, prompt string) (Result, err
 	cmd.Dir = dir
 	cmd.Stdin = strings.NewReader(prompt)
 	cmd.WaitDelay = waitDelay
-	cleanup := isolateProcess(cmd)
+	cleanup := configureProcessCleanup(cmd)
 	defer cleanup()
 	stdout := boundedOutput{limit: maxStdout, stop: stop}
 	stderr := boundedOutput{limit: maxStderr, stop: stop}

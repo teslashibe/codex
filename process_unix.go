@@ -9,7 +9,7 @@ import (
 	"syscall"
 )
 
-func isolateProcess(cmd *exec.Cmd) func() {
+func configureProcessCleanup(cmd *exec.Cmd) func() {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	kill := func() error {
 		if cmd.Process == nil {

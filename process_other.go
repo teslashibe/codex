@@ -6,6 +6,6 @@ import "os/exec"
 
 // WaitDelay bounds pipe cleanup on other platforms, but descendant processes
 // are not killed as a group.
-func isolateProcess(cmd *exec.Cmd) func() {
+func configureProcessCleanup(cmd *exec.Cmd) func() {
 	return func() {}
 }
