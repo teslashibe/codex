@@ -93,48 +93,105 @@ func fakeClient(t *testing.T, scenario string) *Client {
 }
 
 func TestRun(t *testing.T) {
-	for _, session := range []string{"", testSession} {
-		t.Run("session="+session, func(t *testing.T) {
-			client := fakeClient(t, "success")
-			client.Model = "--dangerously-bypass-approvals-and-sandbox"
-			capture := t.TempDir() + "/capture.json"
-			t.Setenv("CODEX_TEST_CAPTURE", capture)
-			prompt := "--help\n$(touch /tmp/never-execute); 'quoted'\x00"
-			result, err := client.Run(context.Background(), session, prompt)
-			if err != nil || result != (Result{SessionID: testSession, Text: "final answer"}) {
-				t.Fatalf("Run = %+v, %v", result, err)
-			}
-			var captured struct {
-				Args   []string
-				Prompt string
-				Dir    string
-			}
-			data, err := os.ReadFile(capture)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := json.Unmarshal(data, &captured); err != nil {
-				t.Fatal(err)
-			}
-			want := []string{"exec", "--json", "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check", "--cd", client.WorkDir,
-				"-c", `sandbox_mode="read-only"`, "-c", `approval_policy="never"`, "--model=" + client.Model}
-			if session == "" {
-				want = append(want, "--", "-")
-			} else {
-				want = append(want, "resume", "--", session, "-")
-			}
-			if !reflect.DeepEqual(captured.Args, want) || captured.Prompt != prompt {
-				t.Fatalf("captured = %+v; want args %q, prompt %q", captured, want, prompt)
-			}
-			actualDir, err := os.Stat(captured.Dir)
-			if err != nil {
-				t.Fatal(err)
-			}
-			wantDir, err := os.Stat(client.WorkDir)
-			if err != nil || !os.SameFile(actualDir, wantDir) {
-				t.Fatalf("cwd = %q; want %q (%v)", captured.Dir, client.WorkDir, err)
+	for _, tc := range []struct {
+		name, model, effort, tier string
+	}{
+		{"defaults", "--dangerously-bypass-approvals-and-sandbox", "", ""},
+		{"low-priority", "gpt-6-astra", "low", "priority"},
+		{"effort-only", "", "low", ""},
+		{"tier-only", "", "", "priority"},
+		{"none-default", "", "none", "default"},
+		{"minimal-flex", "", "minimal", "flex"},
+		{"medium", "", "medium", ""},
+		{"high", "", "high", ""},
+		{"xhigh", "", "xhigh", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, session := range []string{"", testSession} {
+				t.Run("session="+session, func(t *testing.T) {
+					client := fakeClient(t, "success")
+					client.Model = tc.model
+					client.ReasoningEffort = tc.effort
+					client.ServiceTier = tc.tier
+					capture := t.TempDir() + "/capture.json"
+					t.Setenv("CODEX_TEST_CAPTURE", capture)
+					prompt := "--help\n$(touch /tmp/never-execute); 'quoted'\x00"
+					result, err := client.Run(context.Background(), session, prompt)
+					if err != nil || result != (Result{SessionID: testSession, Text: "final answer"}) {
+						t.Fatalf("Run = %+v, %v", result, err)
+					}
+					var captured struct {
+						Args   []string
+						Prompt string
+						Dir    string
+					}
+					data, err := os.ReadFile(capture)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := json.Unmarshal(data, &captured); err != nil {
+						t.Fatal(err)
+					}
+					want := []string{"exec", "--json", "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check", "--cd", client.WorkDir,
+						"-c", `sandbox_mode="read-only"`, "-c", `approval_policy="never"`}
+					if tc.model != "" {
+						want = append(want, "--model="+tc.model)
+					}
+					if tc.effort != "" {
+						want = append(want, "-c", `model_reasoning_effort="`+tc.effort+`"`)
+					}
+					if tc.tier != "" {
+						want = append(want, "-c", `service_tier="`+tc.tier+`"`)
+					}
+					if session == "" {
+						want = append(want, "--", "-")
+					} else {
+						want = append(want, "resume", "--", session, "-")
+					}
+					if !reflect.DeepEqual(captured.Args, want) || captured.Prompt != prompt {
+						t.Fatalf("captured = %+v; want args %q, prompt %q", captured, want, prompt)
+					}
+					actualDir, err := os.Stat(captured.Dir)
+					if err != nil {
+						t.Fatal(err)
+					}
+					wantDir, err := os.Stat(client.WorkDir)
+					if err != nil || !os.SameFile(actualDir, wantDir) {
+						t.Fatalf("cwd = %q; want %q (%v)", captured.Dir, client.WorkDir, err)
+					}
+				})
 			}
 		})
+	}
+}
+
+func TestRunConfigValidation(t *testing.T) {
+	for _, session := range []string{"", testSession} {
+		for _, field := range []string{"reasoning effort", "service tier"} {
+			for _, value := range []string{
+				"unknown", "LOW", "fast", " low", "low ", "priority\n",
+				"--dangerously-bypass-approvals-and-sandbox", "\x00",
+				"low\"\napproval_policy=\"never", "$(touch /tmp/never-execute)",
+			} {
+				t.Run(field+"/"+value+"/session="+session, func(t *testing.T) {
+					client := fakeClient(t, "success")
+					capture := t.TempDir() + "/capture.json"
+					t.Setenv("CODEX_TEST_CAPTURE", capture)
+					if field == "reasoning effort" {
+						client.ReasoningEffort = value
+					} else {
+						client.ServiceTier = value
+					}
+					result, err := client.Run(context.Background(), session, "prompt")
+					if err == nil || !strings.Contains(err.Error(), "invalid "+field) || result != (Result{SessionID: session}) {
+						t.Fatalf("Run = %+v, %v; want invalid %s", result, err, field)
+					}
+					if _, err := os.Stat(capture); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("CLI started for invalid configuration: %v", err)
+					}
+				})
+			}
+		}
 	}
 }
 

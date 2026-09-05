@@ -33,6 +33,13 @@ type Client struct {
 	WorkDir string
 	Model   string
 	Timeout time.Duration
+
+	// ReasoningEffort overrides model_reasoning_effort. Allowed values are
+	// none, minimal, low, medium, high, and xhigh; empty keeps the CLI default.
+	ReasoningEffort string
+	// ServiceTier overrides service_tier. Allowed values are default, priority
+	// (Fast), and flex; empty keeps the CLI default. Model support may vary.
+	ServiceTier string
 }
 
 // Result contains the session ID and the last completed agent message.
@@ -57,6 +64,16 @@ func (c *Client) Run(ctx context.Context, sessionID, prompt string) (Result, err
 	}
 	if c.Timeout < 0 {
 		return result, errors.New("codex: timeout must not be negative")
+	}
+	switch c.ReasoningEffort {
+	case "", "none", "minimal", "low", "medium", "high", "xhigh":
+	default:
+		return result, fmt.Errorf("codex: invalid reasoning effort %q: want none, minimal, low, medium, high, xhigh, or empty", c.ReasoningEffort)
+	}
+	switch c.ServiceTier {
+	case "", "default", "priority", "flex":
+	default:
+		return result, fmt.Errorf("codex: invalid service tier %q: want default, priority, flex, or empty", c.ServiceTier)
 	}
 	timeout := c.Timeout
 	if timeout == 0 {
@@ -87,6 +104,12 @@ func (c *Client) Run(ctx context.Context, sessionID, prompt string) (Result, err
 	}
 	if c.Model != "" {
 		args = append(args, "--model="+c.Model)
+	}
+	if c.ReasoningEffort != "" {
+		args = append(args, "-c", `model_reasoning_effort="`+c.ReasoningEffort+`"`)
+	}
+	if c.ServiceTier != "" {
+		args = append(args, "-c", `service_tier="`+c.ServiceTier+`"`)
 	}
 	if sessionID != "" {
 		args = append(args, "resume", "--", sessionID, "-")
