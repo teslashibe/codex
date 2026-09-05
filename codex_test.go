@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -29,11 +30,30 @@ func TestMain(m *testing.M) {
 		prompt, _ := io.ReadAll(os.Stdin)
 		if path := os.Getenv("CODEX_TEST_CAPTURE"); path != "" {
 			cwd, _ := os.Getwd()
+			var schemaPath, schemaText string
+			var schemaMode os.FileMode
+			for i, arg := range os.Args[1:] {
+				if arg == "--output-schema" {
+					schemaPath = os.Args[i+2]
+					data, err := os.ReadFile(schemaPath)
+					if err != nil {
+						panic(err)
+					}
+					info, err := os.Stat(schemaPath)
+					if err != nil {
+						panic(err)
+					}
+					schemaText, schemaMode = string(data), info.Mode()
+				}
+			}
 			data, _ := json.Marshal(struct {
-				Args   []string
-				Prompt string
-				Dir    string
-			}{os.Args[1:], string(prompt), cwd})
+				Args       []string
+				Prompt     string
+				Dir        string
+				SchemaPath string
+				SchemaText string
+				SchemaMode os.FileMode
+			}{os.Args[1:], string(prompt), cwd, schemaPath, schemaText, schemaMode})
 			if err := os.WriteFile(path, data, 0600); err != nil {
 				panic(err)
 			}
@@ -44,6 +64,9 @@ func TestMain(m *testing.M) {
 			fmt.Println(`{"type":"item.completed","item":{"type":"agent_message","text":"working..."}}`)
 			fmt.Println(`{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"secret tool output"}}`)
 			fmt.Print(answerEvent, completedEvent)
+		case "structured":
+			fmt.Println(`{"type":"item.completed","item":{"type":"agent_message","text":"{\"ok\":true}"}}`)
+			fmt.Print(completedEvent)
 		case "exit":
 			fmt.Fprint(os.Stderr, "authentication failed")
 			os.Exit(3)
@@ -233,6 +256,168 @@ func TestRunInstructionsLimit(t *testing.T) {
 				t.Fatalf("CLI started for oversize instructions: %v", err)
 			}
 		})
+	}
+}
+
+func TestRunOutputSchema(t *testing.T) {
+	for _, tc := range []struct {
+		name, schema string
+	}{
+		{"empty", ""},
+		{"object", "{}"},
+		{"schema", " \n{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"}},\"required\":[\"ok\"],\"additionalProperties\":false}\t"},
+		{"limit", "{" + strings.Repeat(" ", maxSchema-2) + "}"},
+	} {
+		for _, session := range []string{"", testSession} {
+			t.Run(tc.name+"/session="+session, func(t *testing.T) {
+				client := fakeClient(t, "structured")
+				client.OutputSchema = json.RawMessage(tc.schema)
+				capture := filepath.Join(t.TempDir(), "capture.json")
+				t.Setenv("CODEX_TEST_CAPTURE", capture)
+				result, err := client.Run(context.Background(), session, "prompt")
+				if err != nil || result != (Result{SessionID: testSession, Text: `{"ok":true}`}) {
+					t.Fatalf("Run = %+v, %v", result, err)
+				}
+				var captured struct {
+					Args       []string
+					SchemaPath string
+					SchemaText string
+					SchemaMode os.FileMode
+				}
+				data, err := os.ReadFile(capture)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := json.Unmarshal(data, &captured); err != nil {
+					t.Fatal(err)
+				}
+				want := []string{"exec", "--json", "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check", "--cd", client.WorkDir,
+					"-c", `sandbox_mode="read-only"`, "-c", `approval_policy="never"`}
+				if tc.schema != "" {
+					if captured.SchemaText != tc.schema || captured.SchemaMode != 0600 {
+						t.Fatalf("schema contents match = %v, mode = %v", captured.SchemaText == tc.schema, captured.SchemaMode)
+					}
+					if !filepath.IsAbs(captured.SchemaPath) {
+						t.Fatalf("schema path must be absolute: %q", captured.SchemaPath)
+					}
+					rel, err := filepath.Rel(client.WorkDir, captured.SchemaPath)
+					if err != nil || !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+						t.Fatalf("schema must be outside work directory: %q, %v", rel, err)
+					}
+					if _, err := os.Stat(captured.SchemaPath); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("schema not removed: %v", err)
+					}
+					want = append(want, "--output-schema", captured.SchemaPath)
+				}
+				if session == "" {
+					want = append(want, "--", "-")
+				} else {
+					want = append(want, "resume", "--", session, "-")
+				}
+				if !reflect.DeepEqual(captured.Args, want) {
+					t.Fatalf("args = %q; want %q", captured.Args, want)
+				}
+			})
+		}
+	}
+}
+
+func TestRunOutputSchemaValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name, schema, message string
+	}{
+		{"whitespace", " \n\t", "must be a JSON object"},
+		{"null", "null", "must be a JSON object"},
+		{"array", "[]", "must be a JSON object"},
+		{"string", `"schema"`, "must be a JSON object"},
+		{"number", "42", "must be a JSON object"},
+		{"boolean", "true", "must be a JSON object"},
+		{"malformed", "{", "must be a JSON object"},
+		{"unicode-space", "\u00a0{}", "must be a JSON object"},
+		{"trailing", "{} {}", "must be a JSON object"},
+		{"oversize", "{" + strings.Repeat(" ", maxSchema-1) + "}", "output schema exceeds"},
+	} {
+		for _, session := range []string{"", testSession} {
+			t.Run(tc.name+"/session="+session, func(t *testing.T) {
+				client := fakeClient(t, "structured")
+				client.OutputSchema = json.RawMessage(tc.schema)
+				capture := filepath.Join(t.TempDir(), "capture.json")
+				t.Setenv("CODEX_TEST_CAPTURE", capture)
+				result, err := client.Run(context.Background(), session, "prompt")
+				if err == nil || !strings.Contains(err.Error(), tc.message) || result != (Result{SessionID: session}) {
+					t.Fatalf("Run = %+v, %v; want %q", result, err, tc.message)
+				}
+				if _, err := os.Stat(capture); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("CLI started for invalid schema: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestRunOutputSchemaCleanupOnError(t *testing.T) {
+	for _, scenario := range []string{"exit", "failure", "missing", "stdout", "stderr", "hang", "missing-binary", "canceled", "temp-failure"} {
+		for _, session := range []string{"", testSession} {
+			t.Run(scenario+"/session="+session, func(t *testing.T) {
+				client := fakeClient(t, scenario)
+				client.OutputSchema = json.RawMessage(`{"type":"object"}`)
+				tempDir := t.TempDir()
+				for _, key := range []string{"TMPDIR", "TMP", "TEMP"} {
+					t.Setenv(key, tempDir)
+				}
+				capture := filepath.Join(t.TempDir(), "capture.json")
+				t.Setenv("CODEX_TEST_CAPTURE", capture)
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				switch scenario {
+				case "hang":
+					client.Timeout = 500 * time.Millisecond
+				case "missing-binary":
+					client.Binary = filepath.Join(t.TempDir(), "nonexistent")
+				case "canceled":
+					cancel()
+				case "temp-failure":
+					if err := os.Remove(tempDir); err != nil {
+						t.Fatal(err)
+					}
+				}
+				result, err := client.Run(ctx, session, "prompt")
+				if err == nil || result.Text != "" {
+					t.Fatalf("Run = %+v, %v; want failure with no text", result, err)
+				}
+				if scenario == "temp-failure" {
+					if !strings.Contains(err.Error(), "create output schema") {
+						t.Fatalf("unexpected error: %v", err)
+					}
+					return
+				}
+				entries, err := os.ReadDir(tempDir)
+				if err != nil || len(entries) != 0 {
+					t.Fatalf("schema temporary directory not empty: %v, %v", entries, err)
+				}
+				if scenario == "missing-binary" || scenario == "canceled" {
+					return
+				}
+				var captured struct {
+					SchemaPath string
+					SchemaText string
+					SchemaMode os.FileMode
+				}
+				data, err := os.ReadFile(capture)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := json.Unmarshal(data, &captured); err != nil {
+					t.Fatal(err)
+				}
+				if captured.SchemaPath == "" || captured.SchemaText != string(client.OutputSchema) || captured.SchemaMode != 0600 {
+					t.Fatalf("schema was not readable and private during Run: %+v", captured)
+				}
+				if _, err := os.Stat(captured.SchemaPath); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("schema not removed after failure: %v", err)
+				}
+			})
+		}
 	}
 }
 

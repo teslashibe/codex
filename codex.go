@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,7 @@ import (
 
 const (
 	maxPrompt = 1 << 20
+	maxSchema = 1 << 20
 	maxStdout = 16 << 20
 	maxStderr = 64 << 10
 	waitDelay = time.Second
@@ -25,7 +27,8 @@ const (
 // the current directory, the CLI's default model, and a five-minute timeout.
 // Do not modify a Client while Run is executing.
 // Auth and session storage remain managed by the CLI through CODEX_HOME.
-// Run limits prompts and instructions to 1 MiB each, stdout to 16 MiB, and stderr to 64 KiB.
+// Run limits prompts, instructions, and output schemas to 1 MiB each,
+// stdout to 16 MiB, and stderr to 64 KiB.
 // Cancellation kills the process group on macOS/Linux; elsewhere only the CLI
 // process is killed. Pipe cleanup is bounded to one additional second.
 type Client struct {
@@ -37,6 +40,11 @@ type Client struct {
 	// Instructions overrides developer_instructions for new and resumed sessions.
 	// Empty keeps the CLI default; values are limited to 1 MiB.
 	Instructions string
+
+	// OutputSchema optionally constrains the final response for new and resumed
+	// sessions. It must be a JSON object of at most 1 MiB; empty disables it.
+	// The CLI validates schema semantics. The final JSON remains in Result.Text.
+	OutputSchema json.RawMessage
 
 	// ReasoningEffort overrides model_reasoning_effort. Allowed values are
 	// none, minimal, low, medium, high, and xhigh; empty keeps the CLI default.
@@ -68,6 +76,15 @@ func (c *Client) Run(ctx context.Context, sessionID, prompt string) (Result, err
 	}
 	if len(c.Instructions) > maxPrompt {
 		return result, fmt.Errorf("codex: instructions exceeds %d bytes", maxPrompt)
+	}
+	if len(c.OutputSchema) > maxSchema {
+		return result, fmt.Errorf("codex: output schema exceeds %d bytes", maxSchema)
+	}
+	if len(c.OutputSchema) != 0 {
+		schema := bytes.TrimSpace(c.OutputSchema)
+		if !json.Valid(c.OutputSchema) || schema[0] != '{' {
+			return result, errors.New("codex: output schema must be a JSON object")
+		}
 	}
 	if c.Timeout < 0 {
 		return result, errors.New("codex: timeout must not be negative")
@@ -122,6 +139,21 @@ func (c *Client) Run(ctx context.Context, sessionID, prompt string) (Result, err
 		instructions, _ := json.Marshal(c.Instructions)
 		// JSON string escapes are TOML-compatible, but TOML also requires DEL escaped.
 		args = append(args, "-c", "developer_instructions="+strings.ReplaceAll(string(instructions), "\x7f", `\u007f`))
+	}
+	if len(c.OutputSchema) != 0 {
+		// Use the system temporary directory, not the agent's working directory.
+		schema, err := os.CreateTemp("", "codex-output-schema-*.json")
+		if err != nil {
+			return result, fmt.Errorf("codex: create output schema: %w", err)
+		}
+		defer os.Remove(schema.Name())
+		_, writeErr := schema.Write(c.OutputSchema)
+		closeErr := schema.Close()
+		if err := errors.Join(writeErr, closeErr); err != nil {
+			return result, fmt.Errorf("codex: write output schema: %w", err)
+		}
+		// Keep this exec option before resume (supported by Codex 0.153.1).
+		args = append(args, "--output-schema", schema.Name())
 	}
 	if sessionID != "" {
 		args = append(args, "resume", "--", sessionID, "-")
