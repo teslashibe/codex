@@ -220,6 +220,7 @@ func TestParseEvents(t *testing.T) {
 		{"empty", "", true},
 		{"malformed", startedEvent + "not json\n", true},
 		{"missing type", startedEvent + "{}\n", true},
+		{"recovered stream error", startedEvent + "{\"type\":\"error\",\"message\":\"retrying\"}\n" + answerEvent + completedEvent, false},
 		{"missing complete", startedEvent + answerEvent, true},
 		{"missing thread", answerEvent + completedEvent, true},
 		{"wrong thread", strings.Replace(startedEvent, testSession, "019cb612-9a00-7000-8000-000000000002", 1) + completedEvent, true},

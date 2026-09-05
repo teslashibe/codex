@@ -215,7 +215,9 @@ func parseEvents(data []byte, sessionID string) (Result, error) {
 		case "turn.failed":
 			return result, fmt.Errorf("turn failed: %s", event.Error.Message)
 		case "error":
-			return result, fmt.Errorf("stream error: %s", event.Message)
+			// The CLI also emits this event for recoverable transport errors.
+			// turn.failed, a missing completion, or process exit decide failure.
+			continue
 		}
 	}
 	if err := scanner.Err(); err != nil {
