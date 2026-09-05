@@ -188,6 +188,111 @@ func TestRun(t *testing.T) {
 	}
 }
 
+func TestRunMCPServers(t *testing.T) {
+	for _, session := range []string{"", testSession} {
+		t.Run("session="+session, func(t *testing.T) {
+			client := fakeClient(t, "success")
+			client.MCPServers = map[string]MCPServer{
+				"browser_1-test": {
+					Command: "/usr/bin/node",
+					Args:    []string{"-c", "\"\napproval_policy=\"always\"", "\\\x7f", "世界"},
+					Env:     map[string]string{"TOKEN": "fake-test-secret\n\"\\\x7f", "A.b\"": "literal"},
+					Cwd:     "/tmp/browser dir", StartupTimeoutSeconds: 30,
+				},
+				"a": {Command: "server"},
+			}
+			capture := filepath.Join(t.TempDir(), "capture.json")
+			t.Setenv("CODEX_TEST_CAPTURE", capture)
+			if _, err := client.Run(context.Background(), session, "prompt"); err != nil {
+				t.Fatal(err)
+			}
+			var captured struct{ Args []string }
+			data, err := os.ReadFile(capture)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(data, &captured); err != nil {
+				t.Fatal(err)
+			}
+			want := []string{"exec", "--json", "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check", "--cd", client.WorkDir,
+				"-c", `sandbox_mode="read-only"`, "-c", `approval_policy="never"`,
+				"-c", `mcp_servers.a.command="server"`, "-c", `mcp_servers.a.enabled=true`, "-c", `mcp_servers.a.args=[]`,
+				"-c", `mcp_servers.browser_1-test.command="/usr/bin/node"`, "-c", `mcp_servers.browser_1-test.enabled=true`,
+				"-c", `mcp_servers.browser_1-test.args=["-c","\"\napproval_policy=\"always\"","\\\u007f","世界"]`,
+				"-c", `mcp_servers.browser_1-test.env={"A.b\""="literal","TOKEN"="fake-test-secret\n\"\\\u007f"}`,
+				"-c", `mcp_servers.browser_1-test.cwd="/tmp/browser dir"`, "-c", `mcp_servers.browser_1-test.startup_timeout_sec=30`,
+			}
+			if session == "" {
+				want = append(want, "--", "-")
+			} else {
+				want = append(want, "resume", "--", session, "-")
+			}
+			if !reflect.DeepEqual(captured.Args, want) {
+				t.Fatal("MCP argument capture did not match expected safe overrides")
+			}
+		})
+	}
+}
+
+func TestMCPEnvironmentErrorRedaction(t *testing.T) {
+	for _, scenario := range []string{"exit", "failure"} {
+		t.Run(scenario, func(t *testing.T) {
+			client := fakeClient(t, scenario)
+			secret := "authentication failed"
+			if scenario == "failure" {
+				secret = "model failed"
+			}
+			client.MCPServers = map[string]MCPServer{"browser": {Command: "server", Env: map[string]string{"TOKEN": secret}}}
+			_, err := client.Run(context.Background(), "", "prompt")
+			if err == nil || strings.Contains(err.Error(), secret) || !strings.Contains(err.Error(), "[REDACTED]") {
+				t.Fatal("MCP environment value was not redacted from error")
+			}
+		})
+	}
+}
+
+func TestInvalidMCPServers(t *testing.T) {
+	for _, tc := range []struct {
+		name, serverName string
+		server           MCPServer
+	}{
+		{"empty-name", "", MCPServer{Command: "server"}},
+		{"dotted-name", "browser.env", MCPServer{Command: "server"}},
+		{"option-name", "--config=x", MCPServer{Command: "server"}},
+		{"unicode-name", "世界", MCPServer{Command: "server"}},
+		{"missing-command", "browser", MCPServer{}},
+		{"blank-command", "browser", MCPServer{Command: " \n"}},
+		{"negative-timeout", "browser", MCPServer{Command: "server", StartupTimeoutSeconds: -1}},
+		{"empty-env-key", "browser", MCPServer{Command: "server", Env: map[string]string{"": "secret-test-value"}}},
+		{"equals-env-key", "browser", MCPServer{Command: "server", Env: map[string]string{"A=B": "secret-test-value"}}},
+		{"control-env-key", "browser", MCPServer{Command: "server", Env: map[string]string{"A\nB": "secret-test-value"}}},
+		{"nul-arg", "browser", MCPServer{Command: "server", Args: []string{"\x00"}}},
+		{"invalid-utf8", "browser", MCPServer{Command: "server", Env: map[string]string{"TOKEN": "\xff"}}},
+		{"oversized-args", "browser", MCPServer{Command: "server", Args: []string{strings.Repeat("x", 1<<20)}}},
+		{"oversized-env", "browser", MCPServer{Command: "server", Env: map[string]string{"TOKEN": strings.Repeat("x", 1<<20)}}},
+		{"escaped-limit", "browser", MCPServer{Command: "server", Args: []string{strings.Repeat("\x01", 200000)}}},
+	} {
+		for _, session := range []string{"", testSession} {
+			t.Run(tc.name+"/session="+session, func(t *testing.T) {
+				client := fakeClient(t, "success")
+				client.MCPServers = map[string]MCPServer{tc.serverName: tc.server}
+				capture := filepath.Join(t.TempDir(), "capture.json")
+				t.Setenv("CODEX_TEST_CAPTURE", capture)
+				result, err := client.Run(context.Background(), session, "prompt")
+				if err == nil || result != (Result{SessionID: session}) {
+					t.Fatal("expected MCP validation failure")
+				}
+				if strings.Contains(err.Error(), "secret-test-value") {
+					t.Fatal("validation error disclosed environment value")
+				}
+				if _, err := os.Stat(capture); !errors.Is(err, os.ErrNotExist) {
+					t.Fatal("CLI started with invalid MCP configuration")
+				}
+			})
+		}
+	}
+}
+
 func TestRunInstructions(t *testing.T) {
 	for _, tc := range []struct {
 		name, instructions, quoted string

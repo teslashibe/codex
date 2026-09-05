@@ -11,8 +11,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -52,6 +55,23 @@ type Client struct {
 	// ServiceTier overrides service_tier. Allowed values are default, priority
 	// (Fast), and flex; empty keeps the CLI default. Model support may vary.
 	ServiceTier string
+
+	// MCPServers explicitly enables trusted stdio MCP servers. User config remains
+	// ignored. Treat commands and environment values as sensitive configuration;
+	// overrides are passed in the CLI argument vector. Empty enables no servers.
+	MCPServers map[string]MCPServer
+}
+
+// MCPServer configures a trusted stdio server, enabled for new and resumed sessions.
+// StartupTimeoutSeconds zero keeps the CLI default. All MCP overrides together
+// are limited to 1 MiB. Server names use only ASCII letters, digits, '_' and '-'.
+// MCP servers run outside the CLI sandbox; configure only trusted executables.
+type MCPServer struct {
+	Command               string            `json:"command"`
+	Args                  []string          `json:"args,omitempty"`
+	Env                   map[string]string `json:"env,omitempty"`
+	Cwd                   string            `json:"cwd,omitempty"`
+	StartupTimeoutSeconds int               `json:"startup_timeout_sec,omitempty"`
 }
 
 // Result contains the session ID and the last completed agent message.
@@ -99,6 +119,10 @@ func (c *Client) Run(ctx context.Context, sessionID, prompt string) (Result, err
 	default:
 		return result, fmt.Errorf("codex: invalid service tier %q: want default, priority, flex, or empty", c.ServiceTier)
 	}
+	mcpArgs, err := mcpOverrides(c.MCPServers)
+	if err != nil {
+		return result, err
+	}
 	timeout := c.Timeout
 	if timeout == 0 {
 		timeout = 5 * time.Minute
@@ -117,7 +141,7 @@ func (c *Client) Run(ctx context.Context, sessionID, prompt string) (Result, err
 	if dir == "" {
 		dir = "."
 	}
-	dir, err := filepath.Abs(dir)
+	dir, err = filepath.Abs(dir)
 	if err != nil {
 		return result, fmt.Errorf("codex: working directory: %w", err)
 	}
@@ -136,10 +160,9 @@ func (c *Client) Run(ctx context.Context, sessionID, prompt string) (Result, err
 		args = append(args, "-c", `service_tier="`+c.ServiceTier+`"`)
 	}
 	if c.Instructions != "" {
-		instructions, _ := json.Marshal(c.Instructions)
-		// JSON string escapes are TOML-compatible, but TOML also requires DEL escaped.
-		args = append(args, "-c", "developer_instructions="+strings.ReplaceAll(string(instructions), "\x7f", `\u007f`))
+		args = append(args, "-c", "developer_instructions="+tomlString(c.Instructions))
 	}
+	args = append(args, mcpArgs...)
 	if len(c.OutputSchema) != 0 {
 		// Use the system temporary directory, not the agent's working directory.
 		schema, err := os.CreateTemp("", "codex-output-schema-*.json")
@@ -179,13 +202,115 @@ func (c *Client) Run(ctx context.Context, sessionID, prompt string) (Result, err
 	if stdout.exceeded || stderr.exceeded {
 		return result, fmt.Errorf("codex: output limit exceeded (stdout %d bytes, stderr %d bytes)", maxStdout, maxStderr)
 	}
+	if parseErr != nil {
+		parseErr = errors.New(redactMCPEnv(parseErr.Error(), c.MCPServers))
+	}
 	if runErr != nil {
-		return result, fmt.Errorf("codex: process failed: %w; stderr: %s", errors.Join(runErr, parseErr), strings.TrimSpace(stderr.buf.String()))
+		return result, fmt.Errorf("codex: process failed: %w; stderr: %s", errors.Join(runErr, parseErr), redactMCPEnv(strings.TrimSpace(stderr.buf.String()), c.MCPServers))
 	}
 	if parseErr != nil {
 		return result, fmt.Errorf("codex: %w", parseErr)
 	}
 	return parsed, nil
+}
+
+func redactMCPEnv(message string, servers map[string]MCPServer) string {
+	for _, server := range servers {
+		for _, value := range server.Env {
+			if value == "" {
+				continue
+			}
+			quoted := tomlString(value)
+			message = strings.ReplaceAll(message, quoted[1:len(quoted)-1], "[REDACTED]")
+			message = strings.ReplaceAll(message, value, "[REDACTED]")
+		}
+	}
+	return message
+}
+
+func tomlString(value string) string {
+	quoted, _ := json.Marshal(value)
+	// JSON string escapes are TOML-compatible, but TOML also requires DEL escaped.
+	return strings.ReplaceAll(string(quoted), "\x7f", `\u007f`)
+}
+
+func mcpOverrides(servers map[string]MCPServer) ([]string, error) {
+	const maxMCP = 1 << 20
+	// Bound raw input (including entry overhead) before allocating quoted values.
+	total := 0
+	check := func(value string) bool {
+		if len(value) > maxMCP-total || !utf8.ValidString(value) || strings.ContainsRune(value, 0) {
+			return false
+		}
+		total += len(value) + 32
+		return total <= maxMCP
+	}
+	names := make([]string, 0)
+	for name, server := range servers {
+		if name == "" || strings.Trim(name, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-") != "" {
+			return nil, errors.New("codex: invalid MCP server name")
+		}
+		if strings.TrimSpace(server.Command) == "" || server.StartupTimeoutSeconds < 0 {
+			return nil, errors.New("codex: MCP command is required and startup timeout must not be negative")
+		}
+		if !check(name) || !check(server.Command) || !check(server.Cwd) {
+			return nil, errors.New("codex: invalid or oversized MCP configuration (limit 1 MiB)")
+		}
+		for _, arg := range server.Args {
+			if !check(arg) {
+				return nil, errors.New("codex: invalid or oversized MCP arguments (limit 1 MiB)")
+			}
+		}
+		for key, value := range server.Env {
+			if key == "" || strings.ContainsRune(key, '=') || strings.ContainsFunc(key, func(r rune) bool { return r < 32 || r == 127 }) {
+				return nil, errors.New("codex: invalid MCP environment key")
+			}
+			if !check(key) || !check(value) {
+				return nil, errors.New("codex: invalid or oversized MCP environment (limit 1 MiB)")
+			}
+		}
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	var args []string
+	for _, name := range names {
+		server := servers[name]
+		prefix := "mcp_servers." + name + "."
+		args = append(args, "-c", prefix+"command="+tomlString(server.Command), "-c", prefix+"enabled=true")
+		quotedArgs := make([]string, 0, len(server.Args))
+		for _, arg := range server.Args {
+			quotedArgs = append(quotedArgs, tomlString(arg))
+		}
+		args = append(args, "-c", prefix+"args=["+strings.Join(quotedArgs, ",")+"]")
+		if len(server.Env) != 0 {
+			keys := make([]string, 0, len(server.Env))
+			for key := range server.Env {
+				keys = append(keys, key)
+			}
+			slices.Sort(keys)
+			entries := make([]string, 0, len(keys))
+			for _, key := range keys {
+				entries = append(entries, tomlString(key)+"="+tomlString(server.Env[key]))
+			}
+			// The CLI splits override paths on dots without parsing quoted keys.
+			// An inline table keeps environment keys literal, including dots.
+			args = append(args, "-c", prefix+"env={"+strings.Join(entries, ",")+"}")
+		}
+		if server.Cwd != "" {
+			args = append(args, "-c", prefix+"cwd="+tomlString(server.Cwd))
+		}
+		if server.StartupTimeoutSeconds != 0 {
+			args = append(args, "-c", prefix+"startup_timeout_sec="+strconv.Itoa(server.StartupTimeoutSeconds))
+		}
+	}
+	total = 0
+	for _, arg := range args {
+		total += len(arg) + 1
+		if total > maxMCP {
+			return nil, errors.New("codex: MCP overrides exceed 1 MiB")
+		}
+	}
+	return args, nil
 }
 
 func validSessionID(id string) bool {
