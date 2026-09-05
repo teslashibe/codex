@@ -25,7 +25,7 @@ const (
 // the current directory, the CLI's default model, and a five-minute timeout.
 // Do not modify a Client while Run is executing.
 // Auth and session storage remain managed by the CLI through CODEX_HOME.
-// Run limits prompts to 1 MiB, stdout to 16 MiB, and stderr to 64 KiB.
+// Run limits prompts and instructions to 1 MiB each, stdout to 16 MiB, and stderr to 64 KiB.
 // Cancellation kills the process group on macOS/Linux; elsewhere only the CLI
 // process is killed. Pipe cleanup is bounded to one additional second.
 type Client struct {
@@ -33,6 +33,10 @@ type Client struct {
 	WorkDir string
 	Model   string
 	Timeout time.Duration
+
+	// Instructions overrides developer_instructions for new and resumed sessions.
+	// Empty keeps the CLI default; values are limited to 1 MiB.
+	Instructions string
 
 	// ReasoningEffort overrides model_reasoning_effort. Allowed values are
 	// none, minimal, low, medium, high, and xhigh; empty keeps the CLI default.
@@ -61,6 +65,9 @@ func (c *Client) Run(ctx context.Context, sessionID, prompt string) (Result, err
 	}
 	if len(prompt) > maxPrompt {
 		return result, fmt.Errorf("codex: prompt exceeds %d bytes", maxPrompt)
+	}
+	if len(c.Instructions) > maxPrompt {
+		return result, fmt.Errorf("codex: instructions exceeds %d bytes", maxPrompt)
 	}
 	if c.Timeout < 0 {
 		return result, errors.New("codex: timeout must not be negative")
@@ -110,6 +117,11 @@ func (c *Client) Run(ctx context.Context, sessionID, prompt string) (Result, err
 	}
 	if c.ServiceTier != "" {
 		args = append(args, "-c", `service_tier="`+c.ServiceTier+`"`)
+	}
+	if c.Instructions != "" {
+		instructions, _ := json.Marshal(c.Instructions)
+		// JSON string escapes are TOML-compatible, but TOML also requires DEL escaped.
+		args = append(args, "-c", "developer_instructions="+strings.ReplaceAll(string(instructions), "\x7f", `\u007f`))
 	}
 	if sessionID != "" {
 		args = append(args, "resume", "--", sessionID, "-")
