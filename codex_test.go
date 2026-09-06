@@ -22,10 +22,6 @@ const completedEvent = `{"type":"turn.completed","usage":{}}` + "\n"
 
 // Re-exec the test binary as a fake CLI, avoiding shell scripts and model calls.
 func TestMain(m *testing.M) {
-	if scenario := os.Getenv("CODEX_RPC_TEST_HELPER"); scenario != "" {
-		runRPCFixture(scenario)
-		os.Exit(0)
-	}
 	if scenario := os.Getenv("CODEX_TEST_HELPER"); scenario != "" {
 		if scenario == "descendant" {
 			time.Sleep(20 * time.Second)

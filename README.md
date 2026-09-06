@@ -76,7 +76,7 @@ go vet ./...
 go test ./...
 ```
 
-Tests are intended to use fake subprocesses rather than an authenticated Codex session. At the current source revision, `go vet ./...` and `go test ./...` are blocked by an undefined `runRPCFixture` reference in `codex_test.go`; `go build ./...` succeeds. There is no executable in this module to install with `go install`.
+Tests use fake subprocesses rather than an authenticated Codex session. There is no executable in this module to install with `go install`.
 
 ## License
 
