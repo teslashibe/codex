@@ -1,11 +1,14 @@
 package codex
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -55,7 +58,7 @@ func TestReviewedInteractiveRuns(t *testing.T) {
 			}
 			msgs := rpcCapture(t, capture)
 			args := string(msgs[0]["args"])
-			for _, want := range []string{`notify=[]`, `plugins.\"browser@bundled\".enabled=false`, `plugins.\"chrome@bundled\".enabled=false`, `node_repl`, `cua_repl`, `existing`} {
+			for _, want := range []string{`notify=[]`, `\"browser@bundled\"={enabled=false}`, `\"chrome@bundled\"={enabled=false}`, `node_repl`, `cua_repl`, `existing`} {
 				if !strings.Contains(args, want) {
 					t.Fatalf("missing %s in %s", want, args)
 				}
@@ -150,6 +153,119 @@ func TestReviewedAdditionalSource(t *testing.T) {
 		t.Fatal("source drift accepted")
 	}
 }
+func TestPluginOverrideActualTOMLSemantics(t *testing.T) {
+	c := reviewedClient(t, "success")
+	c.InteractiveConfig.DisabledPlugins = []string{"browser@bundled", "chrome.v2@market.place"}
+	args, err := c.validateInteractiveConfig(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(args)
+	// Python's standard TOML parser validates the value syntax; path splitting
+	// and recursive merge mirror Codex 0.153.1 config/overrides.rs and merge.rs.
+	// No external service, model, app-server, plugin or tool is started.
+	cmd := exec.Command("python3", "-c", `import json,sys,tomllib,copy
+args=json.load(sys.stdin)
+base={'plugins':{'browser@bundled':{'enabled':True,'review':'keep'},'chrome.v2@market.place':{'enabled':True}},'marketplaces':{'bundled':{'source':'unchanged'}},'mcp_servers':{'node_repl':{'command':'unchanged'},'cua_repl':{'command':'unchanged'}}}
+original=copy.deepcopy(base)
+layer={}
+for i in range(0,len(args),2):
+ assert args[i]=='-c'
+ path,value=args[i+1].split('=',1)
+ value=tomllib.loads('value='+value)['value']
+ parts=path.split('.')
+ target=layer
+ for part in parts[:-1]: target=target.setdefault(part,{})
+ target[parts[-1]]=value
+def merge(a,b):
+ for k,v in b.items():
+  if isinstance(v,dict) and isinstance(a.get(k),dict): merge(a[k],v)
+  else:a[k]=v
+merge(base,layer)
+assert set(base['plugins'])==set(original['plugins'])
+assert all(not p['enabled'] for p in base['plugins'].values())
+assert base['plugins']['browser@bundled']['review']=='keep'
+assert base['marketplaces']==original['marketplaces']
+assert base['mcp_servers']==original['mcp_servers']
+assert base['notify']==[]
+`)
+	cmd.Stdin = bytes.NewReader(payload)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("upstream-equivalent override semantics: %v %s", err, out)
+	}
+}
+
+func TestReviewedDynamicBindings(t *testing.T) {
+	for _, session := range []string{"", testSession} {
+		t.Run("session="+session, func(t *testing.T) {
+			c := reviewedClient(t, "success")
+			c.InteractiveConfig.Bindings = map[string]ReviewedMCPBinding{"authorized_notes": {Server: MCPServer{Command: "/reviewed/notes-adapter", Args: []string{"serve"}, Env: map[string]string{"MODE": "reviewed"}}, DynamicEnvKeys: []string{"SOCKET", "TOKEN"}}}
+			staticHash, _ := MCPServersSHA256(c.MCPServers)
+			for _, socket := range []string{"/tmp/notes-one.sock", "/tmp/notes-two.sock"} {
+				capture := filepath.Join(t.TempDir(), "capture")
+				t.Setenv("CODEX_RPC_CAPTURE", capture)
+				binding := MCPBinding{Name: "authorized_notes", Env: map[string]string{"SOCKET": socket, "TOKEN": "per-run-secret"}}
+				result, err := c.RunInteractive(context.Background(), session, "prompt", nil, binding)
+				if err != nil || result.SessionID != testSession {
+					t.Fatalf("result=%+v err=%v", result, err)
+				}
+				msgs := rpcCapture(t, capture)
+				args := string(msgs[0]["args"])
+				if !strings.Contains(args, socket) || !strings.Contains(args, "authorized_notes") || !strings.Contains(args, "node_repl") || !strings.Contains(args, "cua_repl") {
+					t.Fatalf("incorrect merged registration %s", args)
+				}
+				got, _ := MCPServersSHA256(c.MCPServers)
+				if got != staticHash {
+					t.Fatal("static map mutated")
+				}
+			}
+			c.MCPServers["node_repl"].Env["PROFILE"] = "drift"
+			if _, err := c.RunInteractive(context.Background(), session, "prompt", nil, MCPBinding{Name: "authorized_notes", Env: map[string]string{"SOCKET": "/tmp/new", "TOKEN": "new"}}); err == nil {
+				t.Fatal("static drift blessed by dynamic binding")
+			}
+		})
+	}
+}
+
+func TestBindingRejectsBroadening(t *testing.T) {
+	for _, kind := range []string{"extra-server", "collision", "extra-env", "missing-env", "fixed-env", "duplicate", "duplicate-key"} {
+		t.Run(kind, func(t *testing.T) {
+			c := reviewedClient(t, "success")
+			def := ReviewedMCPBinding{Server: MCPServer{Command: "/reviewed/adapter", Args: []string{"serve"}, Env: map[string]string{"FIXED": "pinned"}}, DynamicEnvKeys: []string{"SOCKET"}}
+			c.InteractiveConfig.Bindings = map[string]ReviewedMCPBinding{"authorized_notes": def}
+			bindings := []MCPBinding{{Name: "authorized_notes", Env: map[string]string{"SOCKET": "/tmp/one"}}}
+			switch kind {
+			case "extra-server":
+				bindings[0].Name = "other"
+			case "collision":
+				bindings[0].Name = "node_repl"
+				c.InteractiveConfig.Bindings["node_repl"] = def
+			case "extra-env":
+				bindings[0].Env["UNREVIEWED"] = "value"
+			case "missing-env":
+				bindings[0].Env = map[string]string{}
+			case "fixed-env":
+				def.DynamicEnvKeys = []string{"FIXED"}
+				c.InteractiveConfig.Bindings["authorized_notes"] = def
+				bindings[0].Env = map[string]string{"FIXED": "overwrite"}
+			case "duplicate":
+				bindings = append(bindings, bindings[0])
+			case "duplicate-key":
+				def.DynamicEnvKeys = []string{"SOCKET", "SOCKET"}
+				c.InteractiveConfig.Bindings["authorized_notes"] = def
+			}
+			capture := filepath.Join(t.TempDir(), "capture")
+			t.Setenv("CODEX_RPC_CAPTURE", capture)
+			if _, err := c.RunInteractive(context.Background(), testSession, "prompt", nil, bindings...); err == nil {
+				t.Fatal("unreviewed binding accepted")
+			}
+			if _, err := os.Stat(capture); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("app-server started")
+			}
+		})
+	}
+}
+
 func TestReviewedAccountNeedsHandler(t *testing.T) {
 	c := reviewedClient(t, "account")
 	c.ExecutionPolicy = ExecutionAccountAccess

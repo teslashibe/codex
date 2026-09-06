@@ -98,8 +98,17 @@ func runRPCFixture(scenario string) {
 	if scenario == "wrong-thread" {
 		thread = "019cb612-9a00-7000-8000-000000000002"
 	}
-	if string(threadRequest["method"]) == `"thread/start"` {
-		notify("thread/started", map[string]any{"thread": map[string]string{"id": thread}})
+	fresh := string(threadRequest["method"]) == `"thread/start"`
+	started := func() { notify("thread/started", map[string]any{"thread": map[string]string{"id": thread}}) }
+	if fresh && scenario == "notification-first" {
+		started()
+	}
+	if !fresh {
+		var p map[string]json.RawMessage
+		_ = json.Unmarshal(threadRequest["params"], &p)
+		if string(p["excludeTurns"]) != "true" {
+			os.Exit(12)
+		}
 	}
 	sandbox := "readOnly"
 	if scenario == "account" {
@@ -116,6 +125,19 @@ func runRPCFixture(scenario string) {
 		reviewer = "guardian_subagent"
 	}
 	response(2, map[string]any{"thread": map[string]string{"id": thread}, "approvalPolicy": policy, "approvalsReviewer": reviewer, "sandbox": map[string]string{"type": sandbox}})
+	if fresh && scenario != "notification-first" {
+		if scenario == "missing-started" {
+			time.Sleep(20 * time.Second)
+			return
+		}
+		if scenario == "mismatch-started" {
+			thread = "019cb612-9a00-7000-8000-000000000003"
+		}
+		started()
+		if scenario == "duplicate-started" {
+			started()
+		}
+	}
 	if scenario == "never" || scenario == "wrong-thread" {
 		time.Sleep(time.Second)
 		return
@@ -277,7 +299,7 @@ func TestRunInteractiveConfigurationBlocked(t *testing.T) {
 	}
 }
 func TestInteractiveLifecycle(t *testing.T) {
-	for _, scenario := range []string{"success", "early-complete"} {
+	for _, scenario := range []string{"success", "notification-first", "early-complete"} {
 		for _, session := range []string{"", testSession} {
 			t.Run(scenario+session, func(t *testing.T) {
 				c := rpcClient(t, scenario)
@@ -481,6 +503,26 @@ func TestInteractiveResolvedAndConcurrent(t *testing.T) {
 		})
 	}
 }
+func TestFreshThreadNotificationValidation(t *testing.T) {
+	for _, scenario := range []string{"missing-started", "mismatch-started", "duplicate-started"} {
+		t.Run(scenario, func(t *testing.T) {
+			c := rpcClient(t, scenario)
+			c.Timeout = 150 * time.Millisecond
+			result, err := c.runInteractive(context.Background(), "", "prompt", nil)
+			if err == nil || result.Text != "" {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+			var ie *InteractiveError
+			if !errors.As(err, &ie) {
+				t.Fatal(err)
+			}
+			if scenario != "duplicate-started" && ie.MayHaveSideEffects {
+				t.Fatal("turn submitted before both thread events validated")
+			}
+		})
+	}
+}
+
 func TestRPCIDs(t *testing.T) {
 	for _, tc := range []struct {
 		id    string

@@ -37,6 +37,68 @@ type ReviewedInteractiveConfig struct {
 	ConfigSHA256, MCPServersSHA256      string
 	DisabledPlugins                     []string
 	Sources                             map[string]string
+	// Bindings pins optional adapter-owned per-run MCP servers. These names
+	// must be absent from both static MCPServers and reviewed ambient config.
+	Bindings map[string]ReviewedMCPBinding
+}
+
+// ReviewedMCPBinding pins a trusted adapter executable, args and fixed env.
+// DynamicEnvKeys is the exact set of required socket/token fields that adapter
+// may supply per run. Do not populate these definitions from chat/model output.
+type ReviewedMCPBinding struct {
+	Server         MCPServer
+	DynamicEnvKeys []string
+}
+
+// MCPBinding supplies only per-run values, never commands or arbitrary flags.
+// The adapter owns these values; they are not authorization from the model.
+type MCPBinding struct {
+	Name string
+	Env  map[string]string
+}
+
+func (c *Client) bindInteractiveMCP(bindings []MCPBinding) (map[string]MCPServer, error) {
+	servers := make(map[string]MCPServer, len(c.MCPServers)+len(bindings))
+	for name, server := range c.MCPServers {
+		servers[name] = server
+	}
+	seen := make(map[string]bool)
+	for _, binding := range bindings {
+		definition, ok := c.InteractiveConfig.Bindings[binding.Name]
+		if !ok || seen[binding.Name] {
+			return nil, configBlocked("unreviewed or duplicate per-run MCP binding")
+		}
+		if _, exists := servers[binding.Name]; exists {
+			return nil, configBlocked("per-run MCP binding collides with static server")
+		}
+		seen[binding.Name] = true
+		if len(binding.Env) != len(definition.DynamicEnvKeys) {
+			return nil, configBlocked("per-run MCP fields do not match review")
+		}
+		server := definition.Server
+		server.Args = slices.Clone(server.Args)
+		server.Env = make(map[string]string, len(definition.Server.Env)+len(binding.Env))
+		for key, value := range definition.Server.Env {
+			server.Env[key] = value
+		}
+		keys := make(map[string]bool)
+		for _, key := range definition.DynamicEnvKeys {
+			value, present := binding.Env[key]
+			if !present || value == "" || keys[key] {
+				return nil, configBlocked("missing or duplicate per-run MCP field")
+			}
+			if _, fixed := server.Env[key]; fixed {
+				return nil, configBlocked("per-run MCP field overwrites fixed environment")
+			}
+			keys[key] = true
+			server.Env[key] = value
+		}
+		servers[binding.Name] = server
+	}
+	if _, err := mcpOverrides(servers); err != nil {
+		return nil, configBlocked("invalid per-run MCP definition")
+	}
+	return servers, nil
 }
 
 // MCPServersSHA256 returns the deterministic fingerprint of explicit MCP
@@ -173,6 +235,7 @@ func (c *Client) validateInteractiveConfig(ctx context.Context) ([]string, error
 		return nil, configBlocked("too many reviewed plugins")
 	}
 	args := []string{"-c", "notify=[]"}
+	pluginEntries := make([]string, 0, len(plugins))
 	for i, name := range plugins {
 		if name == "" || len(name) > 256 || (i > 0 && plugins[i-1] == name) {
 			return nil, configBlocked("invalid reviewed plugin ID")
@@ -182,8 +245,12 @@ func (c *Client) validateInteractiveConfig(ctx context.Context) ([]string, error
 				return nil, configBlocked("invalid reviewed plugin ID")
 			}
 		}
-		args = append(args, "-c", "plugins."+tomlString(name)+".enabled=false")
+		pluginEntries = append(pluginEntries, tomlString(name)+"={enabled=false}")
 	}
+	// CLI override paths use literal split('.'), not TOML key parsing. Quote
+	// plugin IDs inside the TOML value, never in the override path. Recursive
+	// merge retains marketplace metadata while setting each reviewed flag.
+	args = append(args, "-c", "plugins={"+strings.Join(pluginEntries, ",")+"}")
 	// Version inspection does not start app-server, MCP servers, or a model turn.
 	versionCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()

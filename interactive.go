@@ -86,12 +86,18 @@ func (e *InteractiveError) Unwrap() error { return e.Cause }
 // On-request handles only approvals emitted by Codex, not every command. Caller
 // authentication/authorization and the high-impact approval bridge are separate.
 // Run's existing exec/browser path is unchanged. A nil handler denies requests.
-func (c *Client) RunInteractive(ctx context.Context, sessionID, prompt string, handler ApprovalHandler) (Result, error) {
+func (c *Client) RunInteractive(ctx context.Context, sessionID, prompt string, handler ApprovalHandler, bindings ...MCPBinding) (Result, error) {
 	args, err := c.validateInteractiveConfig(ctx)
 	if err != nil {
 		return Result{SessionID: sessionID}, err
 	}
-	return c.runInteractive(ctx, sessionID, prompt, handler, args...)
+	servers, err := c.bindInteractiveMCP(bindings)
+	if err != nil {
+		return Result{SessionID: sessionID}, err
+	}
+	run := *c
+	run.MCPServers = servers
+	return run.runInteractive(ctx, sessionID, prompt, handler, args...)
 }
 
 const maxRPCMessage = 2 << 20
@@ -303,6 +309,7 @@ func (c *Client) runInteractive(ctx context.Context, sessionID, prompt string, h
 		return result, err
 	}
 	stage := 1
+	threadResponse, threadNotification := false, false
 	thread, turn, text := "", "", ""
 	completed := false
 	seenRequests := map[string]bool{}
@@ -397,12 +404,13 @@ func (c *Client) runInteractive(ctx context.Context, sessionID, prompt string, h
 				}
 				switch msg.Method {
 				case "thread/started":
-					if stage != 2 || !validSessionID(p.Thread.ID) || (sessionID != "" && !strings.EqualFold(sessionID, p.Thread.ID)) {
+					if stage < 2 || threadNotification || !validSessionID(p.Thread.ID) || (sessionID != "" && !strings.EqualFold(sessionID, p.Thread.ID)) {
 						return result, errors.New("unexpected thread notification")
 					}
 					if thread != "" && thread != p.Thread.ID {
 						return result, errors.New("thread mismatch")
 					}
+					threadNotification = true
 					thread = p.Thread.ID
 					result.SessionID = thread
 				case "turn/started":
@@ -477,12 +485,16 @@ func (c *Client) runInteractive(ctx context.Context, sessionID, prompt string, h
 					if sessionID != "" {
 						method = "thread/resume"
 						params["threadId"] = sessionID
+						params["excludeTurns"] = true
 					}
 					stage = 2
 					if err := request(2, method, params); err != nil {
 						return result, err
 					}
 				case 2:
+					if threadResponse {
+						return result, errors.New("duplicate thread response")
+					}
 					var response struct {
 						Thread struct {
 							ID string `json:"id"`
@@ -513,21 +525,7 @@ func (c *Client) runInteractive(ctx context.Context, sessionID, prompt string, h
 					}
 					thread = response.Thread.ID
 					result.SessionID = thread
-					params := map[string]any{"threadId": thread, "input": []any{map[string]string{"type": "text", "text": prompt}}, "approvalPolicy": "on-request", "approvalsReviewer": "user", "cwd": dir}
-					if c.ReasoningEffort != "" {
-						params["effort"] = c.ReasoningEffort
-					}
-					if c.ServiceTier != "" {
-						params["serviceTier"] = c.ServiceTier
-					}
-					if len(c.OutputSchema) > 0 {
-						params["outputSchema"] = c.OutputSchema
-					}
-					stage = 3
-					mayHaveEffects = true // Even a lost turn/start reply may have executed tools.
-					if err := request(3, "turn/start", params); err != nil {
-						return result, err
-					}
+					threadResponse = true
 				case 3:
 					var response struct {
 						Turn struct {
@@ -541,6 +539,25 @@ func (c *Client) runInteractive(ctx context.Context, sessionID, prompt string, h
 					stage = 4
 				default:
 					return result, errors.New("unexpected RPC response")
+				}
+			}
+			// Fresh thread/start response and thread/started can arrive in either
+			// order. Submit no turn until both match. Resume need not emit started.
+			if stage == 2 && threadResponse && (sessionID != "" || threadNotification) {
+				params := map[string]any{"threadId": thread, "input": []any{map[string]string{"type": "text", "text": prompt}}, "approvalPolicy": "on-request", "approvalsReviewer": "user", "cwd": dir}
+				if c.ReasoningEffort != "" {
+					params["effort"] = c.ReasoningEffort
+				}
+				if c.ServiceTier != "" {
+					params["serviceTier"] = c.ServiceTier
+				}
+				if len(c.OutputSchema) > 0 {
+					params["outputSchema"] = c.OutputSchema
+				}
+				stage = 3
+				mayHaveEffects = true
+				if err := request(3, "turn/start", params); err != nil {
+					return result, err
 				}
 			}
 			if completed && stage == 4 {
