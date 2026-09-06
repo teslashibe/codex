@@ -42,6 +42,10 @@ const (
 	// the process's OS account. Run rejects it; RunInteractive requires a
 	// reviewed deployment and callback. Not every command will prompt.
 	ExecutionAccountAccess ExecutionPolicy = "account-access"
+	// ExecutionYOLO is Codex --yolo: no approval prompts and no command sandbox.
+	// OS permissions and installed tool access still apply. It is an operator
+	// choice, never derived from chat or model output.
+	ExecutionYOLO ExecutionPolicy = "yolo"
 )
 
 // SandboxMode validates p and returns the documented Codex sandbox mode used by
@@ -53,10 +57,10 @@ func (p ExecutionPolicy) SandboxMode() (string, error) {
 		return "read-only", nil
 	case ExecutionWorkspaceWrite:
 		return "workspace-write", nil
-	case ExecutionAccountAccess:
+	case ExecutionAccountAccess, ExecutionYOLO:
 		return "danger-full-access", nil
 	default:
-		return "", errors.New("codex: invalid execution policy: want read-only, workspace-write, account-access, or empty")
+		return "", errors.New("codex: invalid execution policy: want read-only, workspace-write, account-access, yolo, or empty")
 	}
 }
 
@@ -82,6 +86,7 @@ type Client struct {
 	// Workspace-write permits unattended writes within the CLI's sandbox;
 	// commands requiring escalation still fail, rather than prompt. Account
 	// access is validated but Run rejects it before starting the CLI.
+	// YOLO uses native --yolo on exec and approval_policy=never on app-server.
 	// This does not restrict MCP tools: trusted MCP servers run outside the
 	// sandbox and may mutate external systems even under read-only policy.
 	ExecutionPolicy ExecutionPolicy
@@ -212,7 +217,11 @@ func (c *Client) Run(ctx context.Context, sessionID, prompt string) (Result, err
 	args := []string{
 		"exec", "--json", "--ignore-user-config", "--ignore-rules",
 		"--skip-git-repo-check", "--cd", dir,
-		"-c", "sandbox_mode=" + tomlString(sandbox), "-c", `approval_policy="never"`,
+	}
+	if c.ExecutionPolicy == ExecutionYOLO {
+		args = append(args, "--yolo")
+	} else {
+		args = append(args, "-c", "sandbox_mode="+tomlString(sandbox), "-c", `approval_policy="never"`)
 	}
 	if c.Model != "" {
 		args = append(args, "--model="+c.Model)
