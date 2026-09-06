@@ -91,7 +91,7 @@ func runRPCFixture(scenario string) {
 		return
 	}
 	policy := "on-request"
-	if scenario == "never" {
+	if scenario == "never" || scenario == "yolo" || scenario == "yolo-mcp" {
 		policy = "never"
 	}
 	thread := testSession
@@ -111,7 +111,7 @@ func runRPCFixture(scenario string) {
 		}
 	}
 	sandbox := "readOnly"
-	if scenario == "account" {
+	if scenario == "account" || scenario == "yolo" || scenario == "yolo-mcp" {
 		sandbox = "dangerFullAccess"
 	}
 	if scenario == "workspace" {
@@ -214,7 +214,7 @@ func runRPCFixture(scenario string) {
 		send(map[string]any{"id": 8, "method": "item/fileChange/requestApproval", "params": p})
 		capture(read())
 		notify("item/completed", map[string]any{"threadId": thread, "turnId": "turn-1", "item": map[string]any{"id": "file-1", "type": "fileChange"}})
-	case "mcp", "mcp-input", "mcp-persist", "mcp-null-turn", "mcp-url":
+	case "mcp", "mcp-input", "mcp-persist", "mcp-null-turn", "mcp-url", "yolo-mcp":
 		p := map[string]any{"threadId": thread, "turnId": "turn-1", "serverName": "existing-browser", "mode": "form", "message": "Allow this action?", "requestedSchema": map[string]any{"type": "object", "properties": map[string]any{}}}
 		if scenario == "mcp-input" {
 			p["requestedSchema"] = map[string]any{"type": "object", "properties": map[string]any{"token": map[string]string{"type": "string"}}}
@@ -419,6 +419,54 @@ func TestInteractiveApprovals(t *testing.T) {
 		})
 	}
 }
+func TestInteractiveYOLONeverPolicy(t *testing.T) {
+	c := rpcClient(t, "yolo")
+	c.ExecutionPolicy = ExecutionYOLO
+	capture := filepath.Join(t.TempDir(), "capture")
+	t.Setenv("CODEX_RPC_CAPTURE", capture)
+	result, err := c.runInteractive(context.Background(), testSession, "unattended", nil)
+	if err != nil || result != (Result{SessionID: testSession, Text: "interactive answer"}) {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	messages := rpcCapture(t, capture)
+	var args []string
+	_ = json.Unmarshal(messages[0]["args"], &args)
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, `approval_policy="never"`) || strings.Contains(joined, "on-request") || strings.Contains(joined, "approvals_reviewer") {
+		t.Fatalf("yolo must use never without a reviewer: %s", joined)
+	}
+	var params map[string]json.RawMessage
+	_ = json.Unmarshal(messages[3]["params"], &params)
+	if string(params["approvalPolicy"]) != `"never"` || string(params["approvalsReviewer"]) != "" {
+		t.Fatalf("thread settings: %s", params)
+	}
+}
+
+func TestInteractiveYOLOAcceptsLeftoverMCP(t *testing.T) {
+	c := rpcClient(t, "yolo-mcp")
+	c.ExecutionPolicy = ExecutionYOLO
+	capture := filepath.Join(t.TempDir(), "capture")
+	t.Setenv("CODEX_RPC_CAPTURE", capture)
+	result, err := c.runInteractive(context.Background(), testSession, "unattended", nil)
+	if err != nil || result.Text != "interactive answer" {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	found := false
+	for _, msg := range rpcCapture(t, capture) {
+		if string(msg["id"]) != `"mcp-1"` {
+			continue
+		}
+		var body map[string]json.RawMessage
+		if json.Unmarshal(msg["result"], &body) != nil || string(body["action"]) != `"accept"` {
+			t.Fatalf("leftover MCP not accepted: %s", msg)
+		}
+		found = true
+	}
+	if !found {
+		t.Fatal("expected leftover MCP elicitation")
+	}
+}
+
 func TestInteractiveFailures(t *testing.T) {
 	for _, scenario := range []string{"malformed", "oversized", "stderr", "stderr-limit", "init-error", "wrong-id", "thread-error", "never", "sandbox-broadened", "reviewer-broadened", "wrong-thread", "turn-error", "failed", "stale-item", "permissions", "duplicate", "hang", "cancel", "callback-timeout", "pending-complete"} {
 		t.Run(scenario, func(t *testing.T) {

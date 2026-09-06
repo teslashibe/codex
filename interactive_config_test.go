@@ -277,3 +277,20 @@ func TestReviewedAccountNeedsHandler(t *testing.T) {
 		t.Fatalf("exec err=%v", err)
 	}
 }
+
+func TestReviewedYOLORunsWithoutHandler(t *testing.T) {
+	c := reviewedClient(t, "yolo")
+	c.ExecutionPolicy = ExecutionYOLO
+	capture := filepath.Join(t.TempDir(), "capture")
+	t.Setenv("CODEX_RPC_CAPTURE", capture)
+	result, err := c.RunInteractive(context.Background(), testSession, "reviewed prompt", nil)
+	if err != nil || result != (Result{SessionID: testSession, Text: "interactive answer"}) {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	var args []string
+	_ = json.Unmarshal(rpcCapture(t, capture)[0]["args"], &args)
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, `approval_policy="never"`) || strings.Contains(joined, "on-request") {
+		t.Fatalf("reviewed yolo args: %s", joined)
+	}
+}

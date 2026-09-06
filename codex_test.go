@@ -202,6 +202,7 @@ func TestExecutionPolicySandboxMode(t *testing.T) {
 		{ExecutionReadOnly, "read-only"},
 		{ExecutionWorkspaceWrite, "workspace-write"},
 		{ExecutionAccountAccess, "danger-full-access"},
+		{ExecutionYOLO, "danger-full-access"},
 	} {
 		t.Run(string(tc.policy), func(t *testing.T) {
 			got, err := tc.policy.SandboxMode()
@@ -245,6 +246,29 @@ func TestRunExecutionPolicy(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestRunYOLOUsesNativeFlag(t *testing.T) {
+	client := fakeClient(t, "success")
+	client.ExecutionPolicy = ExecutionYOLO
+	capture := filepath.Join(t.TempDir(), "capture.json")
+	t.Setenv("CODEX_TEST_CAPTURE", capture)
+	result, err := client.Run(context.Background(), testSession, "prompt")
+	if err != nil || result != (Result{SessionID: testSession, Text: "final answer"}) {
+		t.Fatalf("Run = %+v, %v", result, err)
+	}
+	var captured struct{ Args []string }
+	data, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &captured); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"exec", "--json", "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check", "--cd", client.WorkDir, "--yolo", "resume", "--", testSession, "-"}
+	if !reflect.DeepEqual(captured.Args, want) {
+		t.Fatalf("args = %q; want %q", captured.Args, want)
 	}
 }
 

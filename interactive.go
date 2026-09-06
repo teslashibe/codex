@@ -184,8 +184,12 @@ func (c *Client) runInteractive(ctx context.Context, sessionID, prompt string, h
 		binary = "codex"
 	}
 	// Parity overrides disable only reviewed ambient additions, then explicit
-	// server definitions are reapplied unchanged. Approval never is not used.
-	args := []string{"app-server", "--stdio", "-c", "sandbox_mode=" + tomlString(sandbox), "-c", `approval_policy="on-request"`, "-c", `approvals_reviewer="user"`}
+	// server definitions are reapplied unchanged. YOLO uses never; otherwise on-request.
+	approvalPolicy, approvalsReviewer := interactiveApproval(c.ExecutionPolicy)
+	args := []string{"app-server", "--stdio", "-c", "sandbox_mode=" + tomlString(sandbox), "-c", "approval_policy=" + tomlString(approvalPolicy)}
+	if approvalsReviewer != "" {
+		args = append(args, "-c", "approvals_reviewer="+tomlString(approvalsReviewer))
+	}
 	args = append(args, parityArgs...)
 	args = append(args, mcpArgs...)
 	cmd := exec.CommandContext(processCtx, binary, args...)
@@ -373,8 +377,15 @@ func (c *Client) runInteractive(ctx context.Context, sessionID, prompt string, h
 					seenRequests[key] = true
 					req, supported := decodeApproval(msg, thread, turn, items)
 					isMCP := msg.Method == "mcpServer/elicitation/request"
+					isApproval := isMCP || msg.Method == "item/commandExecution/requestApproval" || msg.Method == "item/fileChange/requestApproval"
+					if isApproval && c.ExecutionPolicy == ExecutionYOLO && supported && !completed && pending == nil {
+						if err := reply(msg.ID, isMCP, ApprovalOnce); err != nil {
+							return result, err
+						}
+						continue
+					}
 					if !supported || completed || pending != nil || handler == nil {
-						if isMCP || msg.Method == "item/commandExecution/requestApproval" || msg.Method == "item/fileChange/requestApproval" {
+						if isApproval {
 							if err := reply(msg.ID, isMCP, ApprovalDeny); err != nil {
 								return result, err
 							}
@@ -480,7 +491,10 @@ func (c *Client) runInteractive(ctx context.Context, sessionID, prompt string, h
 					if err := send(map[string]any{"method": "initialized"}); err != nil {
 						return result, err
 					}
-					params := map[string]any{"cwd": dir, "sandbox": sandbox, "approvalPolicy": "on-request", "approvalsReviewer": "user"}
+					params := map[string]any{"cwd": dir, "sandbox": sandbox, "approvalPolicy": approvalPolicy}
+					if approvalsReviewer != "" {
+						params["approvalsReviewer"] = approvalsReviewer
+					}
 					if c.Model != "" {
 						params["model"] = c.Model
 					}
@@ -513,7 +527,7 @@ func (c *Client) runInteractive(ctx context.Context, sessionID, prompt string, h
 							WritableRoots []string `json:"writableRoots"`
 						} `json:"sandbox"`
 					}
-					if json.Unmarshal(msg.Result, &response) != nil || !validSessionID(response.Thread.ID) || response.ApprovalPolicy != "on-request" || response.ApprovalsReviewer != "user" {
+					if json.Unmarshal(msg.Result, &response) != nil || !validSessionID(response.Thread.ID) || response.ApprovalPolicy != approvalPolicy || (approvalsReviewer != "" && response.ApprovalsReviewer != approvalsReviewer) {
 						return result, errors.New("invalid thread or effective approval policy")
 					}
 					expectedSandbox := "readOnly"
@@ -550,7 +564,10 @@ func (c *Client) runInteractive(ctx context.Context, sessionID, prompt string, h
 			// Fresh thread/start response and thread/started can arrive in either
 			// order. Submit no turn until both match. Resume need not emit started.
 			if stage == 2 && threadResponse && (sessionID != "" || threadNotification) {
-				params := map[string]any{"threadId": thread, "input": []any{map[string]string{"type": "text", "text": prompt}}, "approvalPolicy": "on-request", "approvalsReviewer": "user", "cwd": dir}
+				params := map[string]any{"threadId": thread, "input": []any{map[string]string{"type": "text", "text": prompt}}, "approvalPolicy": approvalPolicy, "cwd": dir}
+				if approvalsReviewer != "" {
+					params["approvalsReviewer"] = approvalsReviewer
+				}
 				if c.ReasoningEffort != "" {
 					params["effort"] = c.ReasoningEffort
 				}
@@ -572,6 +589,13 @@ func (c *Client) runInteractive(ctx context.Context, sessionID, prompt string, h
 			}
 		}
 	}
+}
+
+func interactiveApproval(p ExecutionPolicy) (policy, reviewer string) {
+	if p == ExecutionYOLO {
+		return "never", ""
+	}
+	return "on-request", "user"
 }
 
 func validRPCID(id json.RawMessage) bool {
