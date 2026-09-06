@@ -1,4 +1,5 @@
-// Package codex runs the official Codex CLI in a read-only sandbox.
+// Package codex runs the official Codex CLI with an explicit execution policy.
+// The default policy is read-only; sandbox access is not interactive approval.
 package codex
 
 import (
@@ -26,6 +27,43 @@ const (
 	waitDelay = time.Second
 )
 
+// ExecutionPolicy selects filesystem/network sandbox access, not who may ask
+// for it or whether individual actions are approved. Callers must authenticate
+// and authorize the sender and chat before selecting a policy. Never derive it
+// from model output, retrieved content, or an unauthenticated text request.
+type ExecutionPolicy string
+
+const (
+	ExecutionReadOnly       ExecutionPolicy = "read-only"
+	ExecutionWorkspaceWrite ExecutionPolicy = "workspace-write"
+	// ExecutionAccountAccess removes the Codex command sandbox. It does not
+	// elevate the OS user or grant root, credentials, or macOS privacy access.
+	// It is not account isolation: commands can access everything available to
+	// the process's OS account. Run rejects it; RunInteractive requires a
+	// reviewed deployment and callback. Not every command will prompt.
+	ExecutionAccountAccess ExecutionPolicy = "account-access"
+)
+
+// SandboxMode validates p and returns the documented Codex sandbox mode used by
+// Codex 0.153.1 and 0.153.4. Empty preserves the read-only default. This mapping
+// alone does not authorize execution or establish an approval channel.
+func (p ExecutionPolicy) SandboxMode() (string, error) {
+	switch p {
+	case "", ExecutionReadOnly:
+		return "read-only", nil
+	case ExecutionWorkspaceWrite:
+		return "workspace-write", nil
+	case ExecutionAccountAccess:
+		return "danger-full-access", nil
+	default:
+		return "", errors.New("codex: invalid execution policy: want read-only, workspace-write, account-access, or empty")
+	}
+}
+
+// ErrInteractiveApprovalRequired means the requested execution policy cannot be
+// used with the noninteractive exec transport. Do not retry with weaker guards.
+var ErrInteractiveApprovalRequired = errors.New("codex: account-access requires an interactive approval transport; exec is unsupported")
+
 // Client configures Codex invocations. Its zero value uses codex from PATH,
 // the current directory, the CLI's default model, and a five-minute timeout.
 // Do not modify a Client while Run is executing.
@@ -39,6 +77,14 @@ type Client struct {
 	WorkDir string
 	Model   string
 	Timeout time.Duration
+
+	// ExecutionPolicy defaults to read-only for new and resumed sessions.
+	// Workspace-write permits unattended writes within the CLI's sandbox;
+	// commands requiring escalation still fail, rather than prompt. Account
+	// access is validated but Run rejects it before starting the CLI.
+	// This does not restrict MCP tools: trusted MCP servers run outside the
+	// sandbox and may mutate external systems even under read-only policy.
+	ExecutionPolicy ExecutionPolicy
 
 	// Instructions overrides developer_instructions for new and resumed sessions.
 	// Empty keeps the CLI default; values are limited to 1 MiB.
@@ -56,10 +102,15 @@ type Client struct {
 	// (Fast), and flex; empty keeps the CLI default. Model support may vary.
 	ServiceTier string
 
-	// MCPServers explicitly enables trusted stdio MCP servers. User config remains
-	// ignored. Treat commands and environment values as sensitive configuration;
+	// MCPServers explicitly enables trusted stdio MCP servers. Run ignores user
+	// config; RunInteractive requires reviewed parity with ambient definitions.
+	// Treat commands and environment values as sensitive configuration;
 	// overrides are passed in the CLI argument vector. Empty enables no servers.
 	MCPServers map[string]MCPServer
+
+	// InteractiveConfig is an explicit reviewed deployment contract used only
+	// by RunInteractive. Nil fails closed; Run never reads this field.
+	InteractiveConfig *ReviewedInteractiveConfig
 }
 
 // MCPServer configures a trusted stdio server, enabled for new and resumed sessions.
@@ -86,8 +137,21 @@ type Result struct {
 // requires a thread.started event, turn.completed, and a successful CLI exit.
 // User config and execpolicy rules are ignored; this does not isolate credentials,
 // disable project instructions, or replace the CLI's sandbox enforcement.
+// exec is noninteractive: approval_policy remains never, which fails requests
+// needing escalation, not an interactive approval mechanism. Setting on-request
+// would not supply the missing bidirectional request/response channel. MCP tool
+// authorization must be enforced separately; this policy is not an MCP allowlist.
+// An error or cancellation does not roll back commands or MCP side effects;
+// retain the session ID and reconcile uncertain effects before retrying.
 func (c *Client) Run(ctx context.Context, sessionID, prompt string) (Result, error) {
 	result := Result{SessionID: sessionID}
+	sandbox, err := c.ExecutionPolicy.SandboxMode()
+	if err != nil {
+		return result, err
+	}
+	if c.ExecutionPolicy == ExecutionAccountAccess {
+		return result, ErrInteractiveApprovalRequired
+	}
 	if sessionID != "" && !validSessionID(sessionID) {
 		return result, errors.New("codex: session ID must be a UUID")
 	}
@@ -148,7 +212,7 @@ func (c *Client) Run(ctx context.Context, sessionID, prompt string) (Result, err
 	args := []string{
 		"exec", "--json", "--ignore-user-config", "--ignore-rules",
 		"--skip-git-repo-check", "--cd", dir,
-		"-c", `sandbox_mode="read-only"`, "-c", `approval_policy="never"`,
+		"-c", "sandbox_mode=" + tomlString(sandbox), "-c", `approval_policy="never"`,
 	}
 	if c.Model != "" {
 		args = append(args, "--model="+c.Model)
