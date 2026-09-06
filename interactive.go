@@ -62,7 +62,13 @@ type FileChange struct {
 // MCPApproval currently supports only plain empty confirmation forms. URL,
 // extended semantic forms, input schemas and persistence metadata are declined;
 // they need a separately reviewed renderer/validator, not a generic approve button.
-type MCPApproval struct{ ServerName, Message string }
+type MCPApproval struct {
+	ServerName, Message string
+	// ToolName and Arguments are populated only when native approval metadata
+	// matches exactly one active tool call in this thread and turn.
+	ToolName  string
+	Arguments json.RawMessage
+}
 
 // ApprovalHandler must honor ctx cancellation and may retain only copied data.
 // Return only an explicit authenticated per-request decision. A nil handler,
@@ -611,7 +617,7 @@ func decodeApproval(msg rpcMessage, thread, turn string, items map[string]json.R
 		return req, false
 	}
 	present := func(v json.RawMessage) bool { return len(v) > 0 && string(v) != "null" }
-	if present(p.Network) || present(p.ExecAmendment) || present(p.NetworkAmendments) || p.GrantRoot != nil || present(p.Meta) {
+	if present(p.Network) || present(p.ExecAmendment) || present(p.NetworkAmendments) || p.GrantRoot != nil || (present(p.Meta) && msg.Method != "mcpServer/elicitation/request") {
 		return req, false
 	}
 	req.ThreadID, req.TurnID, req.ItemID, req.Reason = p.ThreadID, p.TurnID, p.ItemID, p.Reason
@@ -645,7 +651,60 @@ func decodeApproval(msg rpcMessage, thread, turn string, items map[string]json.R
 			return req, false
 		}
 		req.Kind = ApprovalMCP
-		req.MCP = &MCPApproval{p.ServerName, p.Message}
+		req.MCP = &MCPApproval{ServerName: p.ServerName, Message: p.Message}
+		if present(p.Meta) {
+			var meta struct {
+				Kind        string          `json:"codex_approval_kind"`
+				Description string          `json:"tool_description"`
+				Params      json.RawMessage `json:"tool_params"`
+				Display     json.RawMessage `json:"tool_params_display"`
+				Persist     []string        `json:"persist"`
+			}
+			decoder := json.NewDecoder(bytes.NewReader(p.Meta))
+			decoder.DisallowUnknownFields()
+			if decoder.Decode(&meta) != nil || meta.Kind != "mcp_tool_call" {
+				return req, false
+			}
+			// These are offered UI choices, not required grants. This client
+			// never returns persistence metadata: ApprovalOnce stays one call.
+			for _, scope := range meta.Persist {
+				if scope != "session" && scope != "always" {
+					return req, false
+				}
+			}
+			var params map[string]json.RawMessage
+			if json.Unmarshal(meta.Params, &params) != nil || params == nil {
+				return req, false
+			}
+			canonical, err := json.Marshal(params)
+			if err != nil {
+				return req, false
+			}
+			for id, raw := range items {
+				var item struct {
+					ID, Type, Server, Tool, Status string
+					Arguments                      map[string]json.RawMessage
+				}
+				if json.Unmarshal(raw, &item) != nil || item.Type != "mcpToolCall" || item.Server != p.ServerName || item.Status != "inProgress" {
+					continue
+				}
+				// Multiple active calls on this server are ambiguous even if only
+				// one argument object matches: the request has no native item ID.
+				if req.ItemID != "" || item.ID != id || item.Tool == "" {
+					return req, false
+				}
+				arguments, err := json.Marshal(item.Arguments)
+				if err != nil || !bytes.Equal(arguments, canonical) {
+					return req, false
+				}
+				req.ItemID = id
+				req.MCP.ToolName = item.Tool
+				req.MCP.Arguments = append(json.RawMessage(nil), meta.Params...)
+			}
+			if req.ItemID == "" || req.MCP.ToolName == "" {
+				return req, false
+			}
+		}
 	default:
 		return req, false
 	}
