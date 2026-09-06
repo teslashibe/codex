@@ -71,9 +71,8 @@ type Client struct {
 	Timeout time.Duration
 
 	// ExecutionPolicy defaults to read-only for new and resumed sessions.
-	// Workspace-write permits unattended writes within the CLI's sandbox;
-	// commands requiring escalation still fail, rather than prompt. Account
-	// access is validated but Run rejects it before starting the CLI.
+	// Workspace-write permits writes within the CLI sandbox; YOLO explicitly
+	// removes native command sandboxing and approval prompts.
 	// This does not restrict MCP tools: trusted MCP servers run outside the
 	// sandbox and may mutate external systems even under read-only policy.
 	ExecutionPolicy ExecutionPolicy
