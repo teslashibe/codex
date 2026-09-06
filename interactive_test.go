@@ -15,6 +15,14 @@ import (
 )
 
 func runRPCFixture(scenario string) {
+	if len(os.Args) == 2 && os.Args[1] == "--version" {
+		version := "0.153.1"
+		if scenario == "version-drift" {
+			version = "0.154.0"
+		}
+		fmt.Println("codex-cli " + version)
+		return
+	}
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 4096), maxRPCMessage+1)
 	enc := json.NewEncoder(os.Stdout)
@@ -94,6 +102,12 @@ func runRPCFixture(scenario string) {
 		notify("thread/started", map[string]any{"thread": map[string]string{"id": thread}})
 	}
 	sandbox := "readOnly"
+	if scenario == "account" {
+		sandbox = "dangerFullAccess"
+	}
+	if scenario == "workspace" {
+		sandbox = "workspaceWrite"
+	}
 	if scenario == "sandbox-broadened" {
 		sandbox = "dangerFullAccess"
 	}

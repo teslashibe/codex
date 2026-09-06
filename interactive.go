@@ -13,16 +13,12 @@ import (
 	"time"
 )
 
-// InteractiveConfigurationError blocks launch because app-server 0.153.1 and
-// 0.153.4 do not expose exec's --ignore-user-config/--ignore-rules semantics.
-// Config overrides merge; they do not prove that unknown MCP servers, rules,
-// plugins, hooks, or approval settings were excluded. Changing CODEX_HOME would
-// also change authentication, session storage, and browser context. Do not retry
-// with exec, a different home, or weaker approval settings to work around this.
-type InteractiveConfigurationError struct{}
+// InteractiveConfigurationError means the deployment configuration did not
+// match its explicit review. Never retry with a different home or weaker guards.
+type InteractiveConfigurationError struct{ Reason string }
 
-func (*InteractiveConfigurationError) Error() string {
-	return "codex: interactive configuration isolation is not supported by app-server 0.153.1/0.153.4"
+func (e *InteractiveConfigurationError) Error() string {
+	return "codex: interactive configuration blocked: " + e.Reason
 }
 
 // ApprovalDecision is per-request only. Its zero value declines. No session
@@ -86,14 +82,16 @@ type InteractiveError struct {
 func (e *InteractiveError) Error() string { return "codex: interactive run: " + e.Cause.Error() }
 func (e *InteractiveError) Unwrap() error { return e.Cause }
 
-// RunInteractive is an opt-in, staged app-server entry point. It currently
-// returns InteractiveConfigurationError before starting any process. The tested
-// transport remains internal until configuration isolation parity is proven.
-// Account access additionally requires a reviewed approval bridge and proof of
-// actual command gating; adding on-request alone is not that proof. Run's exec
-// transport, browser configuration, and session behavior are unchanged.
+// RunInteractive validates a reviewed deployment before starting app-server.
+// On-request handles only approvals emitted by Codex, not every command. Caller
+// authentication/authorization and the high-impact approval bridge are separate.
+// Run's existing exec/browser path is unchanged. A nil handler denies requests.
 func (c *Client) RunInteractive(ctx context.Context, sessionID, prompt string, handler ApprovalHandler) (Result, error) {
-	return Result{SessionID: sessionID}, &InteractiveConfigurationError{}
+	args, err := c.validateInteractiveConfig(ctx)
+	if err != nil {
+		return Result{SessionID: sessionID}, err
+	}
+	return c.runInteractive(ctx, sessionID, prompt, handler, args...)
 }
 
 const maxRPCMessage = 2 << 20
@@ -120,15 +118,14 @@ type pendingApproval struct {
 	answer <-chan approvalAnswer
 }
 
-// runInteractive is deliberately unexported: tests exercise actual subprocess
-// I/O here, but production has no flag or injectable verifier bypassing isolation.
-func (c *Client) runInteractive(ctx context.Context, sessionID, prompt string, handler ApprovalHandler) (result Result, runErr error) {
+// runInteractive consumes only generated, validated parity overrides.
+func (c *Client) runInteractive(ctx context.Context, sessionID, prompt string, handler ApprovalHandler, parityArgs ...string) (result Result, runErr error) {
 	result.SessionID = sessionID
 	sandbox, err := c.ExecutionPolicy.SandboxMode()
 	if err != nil {
 		return result, err
 	}
-	if c.ExecutionPolicy == ExecutionAccountAccess {
+	if c.ExecutionPolicy == ExecutionAccountAccess && (c.InteractiveConfig == nil || handler == nil) {
 		return result, ErrInteractiveApprovalRequired
 	}
 	if sessionID != "" && !validSessionID(sessionID) {
@@ -174,10 +171,10 @@ func (c *Client) runInteractive(ctx context.Context, sessionID, prompt string, h
 	if binary == "" {
 		binary = "codex"
 	}
-	// These flags only select transport and request defaults. They do not
-	// establish config isolation; only the blocked public entry point may be
-	// wired here once that separate prerequisite is implemented and verified.
+	// Parity overrides disable only reviewed ambient additions, then explicit
+	// server definitions are reapplied unchanged. Approval never is not used.
 	args := []string{"app-server", "--stdio", "-c", "sandbox_mode=" + tomlString(sandbox), "-c", `approval_policy="on-request"`, "-c", `approvals_reviewer="user"`}
+	args = append(args, parityArgs...)
 	args = append(args, mcpArgs...)
 	cmd := exec.CommandContext(processCtx, binary, args...)
 	cmd.Dir, cmd.WaitDelay = dir, waitDelay
@@ -504,6 +501,9 @@ func (c *Client) runInteractive(ctx context.Context, sessionID, prompt string, h
 					expectedSandbox := "readOnly"
 					if sandbox == "workspace-write" {
 						expectedSandbox = "workspaceWrite"
+					}
+					if sandbox == "danger-full-access" {
+						expectedSandbox = "dangerFullAccess"
 					}
 					if response.Sandbox.Type != expectedSandbox || response.Sandbox.NetworkAccess || len(response.Sandbox.WritableRoots) != 0 {
 						return result, errors.New("unexpected effective sandbox permissions")

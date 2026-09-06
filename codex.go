@@ -39,8 +39,8 @@ const (
 	// ExecutionAccountAccess removes the Codex command sandbox. It does not
 	// elevate the OS user or grant root, credentials, or macOS privacy access.
 	// It is not account isolation: commands can access everything available to
-	// the process's OS account. Run rejects it until interactive approval is
-	// supported; combining it with exec's never policy would bypass approvals.
+	// the process's OS account. Run rejects it; RunInteractive requires a
+	// reviewed deployment and callback. Not every command will prompt.
 	ExecutionAccountAccess ExecutionPolicy = "account-access"
 )
 
@@ -102,10 +102,15 @@ type Client struct {
 	// (Fast), and flex; empty keeps the CLI default. Model support may vary.
 	ServiceTier string
 
-	// MCPServers explicitly enables trusted stdio MCP servers. User config remains
-	// ignored. Treat commands and environment values as sensitive configuration;
+	// MCPServers explicitly enables trusted stdio MCP servers. Run ignores user
+	// config; RunInteractive requires reviewed parity with ambient definitions.
+	// Treat commands and environment values as sensitive configuration;
 	// overrides are passed in the CLI argument vector. Empty enables no servers.
 	MCPServers map[string]MCPServer
+
+	// InteractiveConfig is an explicit reviewed deployment contract used only
+	// by RunInteractive. Nil fails closed; Run never reads this field.
+	InteractiveConfig *ReviewedInteractiveConfig
 }
 
 // MCPServer configures a trusted stdio server, enabled for new and resumed sessions.
