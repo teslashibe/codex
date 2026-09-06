@@ -1,5 +1,5 @@
 // Package codex runs the official Codex CLI with an explicit execution policy.
-// The default policy is read-only; sandbox access is not interactive approval.
+// The default is read-only; native YOLO requires explicit operator selection.
 package codex
 
 import (
@@ -27,10 +27,9 @@ const (
 	waitDelay = time.Second
 )
 
-// ExecutionPolicy selects filesystem/network sandbox access, not who may ask
-// for it or whether individual actions are approved. Callers must authenticate
-// and authorize the sender and chat before selecting a policy. Never derive it
-// from model output, retrieved content, or an unauthenticated text request.
+// ExecutionPolicy selects command access; ExecutionYOLO also disables native
+// approval prompts. Callers must authenticate and authorize the sender and chat
+// before selecting a policy. Never derive it from model output or tool content.
 type ExecutionPolicy string
 
 const (
@@ -42,6 +41,9 @@ const (
 	// the process's OS account. Run rejects it; RunInteractive requires a
 	// reviewed deployment and callback. Not every command will prompt.
 	ExecutionAccountAccess ExecutionPolicy = "account-access"
+	// ExecutionYOLO selects native --yolo: no Codex approval prompts or command
+	// sandbox. OS permissions and installed tool/account access still apply.
+	ExecutionYOLO ExecutionPolicy = "yolo"
 )
 
 // SandboxMode validates p and returns the documented Codex sandbox mode used by
@@ -53,10 +55,10 @@ func (p ExecutionPolicy) SandboxMode() (string, error) {
 		return "read-only", nil
 	case ExecutionWorkspaceWrite:
 		return "workspace-write", nil
-	case ExecutionAccountAccess:
+	case ExecutionAccountAccess, ExecutionYOLO:
 		return "danger-full-access", nil
 	default:
-		return "", errors.New("codex: invalid execution policy: want read-only, workspace-write, account-access, or empty")
+		return "", errors.New("codex: invalid execution policy: want read-only, workspace-write, account-access, yolo, or empty")
 	}
 }
 
@@ -212,7 +214,11 @@ func (c *Client) Run(ctx context.Context, sessionID, prompt string) (Result, err
 	args := []string{
 		"exec", "--json", "--ignore-user-config", "--ignore-rules",
 		"--skip-git-repo-check", "--cd", dir,
-		"-c", "sandbox_mode=" + tomlString(sandbox), "-c", `approval_policy="never"`,
+	}
+	if c.ExecutionPolicy == ExecutionYOLO {
+		args = append(args, "--yolo")
+	} else {
+		args = append(args, "-c", "sandbox_mode="+tomlString(sandbox), "-c", `approval_policy="never"`)
 	}
 	if c.Model != "" {
 		args = append(args, "--model="+c.Model)

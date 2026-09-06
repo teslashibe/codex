@@ -93,6 +93,9 @@ func (e *InteractiveError) Unwrap() error { return e.Cause }
 // authentication/authorization and the high-impact approval bridge are separate.
 // Run's existing exec/browser path is unchanged. A nil handler denies requests.
 func (c *Client) RunInteractive(ctx context.Context, sessionID, prompt string, handler ApprovalHandler, bindings ...MCPBinding) (Result, error) {
+	if c.ExecutionPolicy == ExecutionYOLO {
+		return Result{SessionID: sessionID}, errors.New("codex: yolo uses native exec; call Run")
+	}
 	args, err := c.validateInteractiveConfig(ctx)
 	if err != nil {
 		return Result{SessionID: sessionID}, err
