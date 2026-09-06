@@ -53,7 +53,8 @@ func TestMain(m *testing.M) {
 				SchemaPath string
 				SchemaText string
 				SchemaMode os.FileMode
-			}{os.Args[1:], string(prompt), cwd, schemaPath, schemaText, schemaMode})
+				CodexHome  string
+			}{os.Args[1:], string(prompt), cwd, schemaPath, schemaText, schemaMode, os.Getenv("CODEX_HOME")})
 			if err := os.WriteFile(path, data, 0600); err != nil {
 				panic(err)
 			}
@@ -183,6 +184,148 @@ func TestRun(t *testing.T) {
 						t.Fatalf("cwd = %q; want %q (%v)", captured.Dir, client.WorkDir, err)
 					}
 				})
+			}
+		})
+	}
+}
+
+func TestExecutionPolicySandboxMode(t *testing.T) {
+	for _, tc := range []struct {
+		policy ExecutionPolicy
+		want   string
+	}{
+		{"", "read-only"},
+		{ExecutionReadOnly, "read-only"},
+		{ExecutionWorkspaceWrite, "workspace-write"},
+		{ExecutionAccountAccess, "danger-full-access"},
+	} {
+		t.Run(string(tc.policy), func(t *testing.T) {
+			got, err := tc.policy.SandboxMode()
+			if err != nil || got != tc.want {
+				t.Fatalf("SandboxMode = %q, %v; want %q", got, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestRunExecutionPolicy(t *testing.T) {
+	for _, policy := range []ExecutionPolicy{"", ExecutionReadOnly, ExecutionWorkspaceWrite} {
+		for _, session := range []string{"", testSession} {
+			t.Run(string(policy)+"/session="+session, func(t *testing.T) {
+				client := fakeClient(t, "success")
+				client.ExecutionPolicy = policy
+				capture := filepath.Join(t.TempDir(), "capture.json")
+				t.Setenv("CODEX_TEST_CAPTURE", capture)
+				result, err := client.Run(context.Background(), session, "prompt")
+				if err != nil || result != (Result{SessionID: testSession, Text: "final answer"}) {
+					t.Fatalf("Run = %+v, %v", result, err)
+				}
+				var captured struct{ Args []string }
+				data, err := os.ReadFile(capture)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := json.Unmarshal(data, &captured); err != nil {
+					t.Fatal(err)
+				}
+				sandbox, _ := policy.SandboxMode()
+				want := []string{"exec", "--json", "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check", "--cd", client.WorkDir,
+					"-c", "sandbox_mode=" + tomlString(sandbox), "-c", `approval_policy="never"`}
+				if session == "" {
+					want = append(want, "--", "-")
+				} else {
+					want = append(want, "resume", "--", session, "-")
+				}
+				if !reflect.DeepEqual(captured.Args, want) {
+					t.Fatalf("args = %q; want %q", captured.Args, want)
+				}
+			})
+		}
+	}
+}
+
+func TestRunExecutionPolicyRejected(t *testing.T) {
+	for _, policy := range []ExecutionPolicy{
+		ExecutionAccountAccess, "danger-full-access", "unknown", "READ-ONLY", " read-only", "workspace-write ",
+		"--dangerously-bypass-approvals-and-sandbox", "read-only\x00", "read-only\"\napproval_policy=\"never", "$(touch /tmp/never-execute)",
+	} {
+		for _, session := range []string{"", testSession} {
+			t.Run(string(policy)+"/session="+session, func(t *testing.T) {
+				client := fakeClient(t, "success")
+				client.ExecutionPolicy = policy
+				capture := filepath.Join(t.TempDir(), "capture.json")
+				t.Setenv("CODEX_TEST_CAPTURE", capture)
+				result, err := client.Run(context.Background(), session, "prompt")
+				if err == nil || result != (Result{SessionID: session}) {
+					t.Fatalf("Run = %+v, %v; want failure retaining session", result, err)
+				}
+				if policy == ExecutionAccountAccess {
+					if !errors.Is(err, ErrInteractiveApprovalRequired) {
+						t.Fatalf("missing interactive approval error: %v", err)
+					}
+				} else {
+					if !strings.Contains(err.Error(), "invalid execution policy") {
+						t.Fatalf("unexpected error: %v", err)
+					}
+					if mode, err := policy.SandboxMode(); err == nil || mode != "" {
+						t.Fatalf("invalid policy maps to mode %q, %v", mode, err)
+					}
+				}
+				if _, err := os.Stat(capture); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("CLI started with rejected policy: %v", err)
+				}
+			})
+		}
+	}
+}
+
+// This is an invocation regression, not evidence that a live browser executed.
+// Changing execution policy must not replace sessions, the user's Codex home,
+// explicit tool registration, or browser instructions.
+func TestExecutionPolicyPreservesBrowserInvocation(t *testing.T) {
+	for _, session := range []string{"", testSession} {
+		t.Run("session="+session, func(t *testing.T) {
+			client := fakeClient(t, "success")
+			client.Model = "gpt-5.4"
+			client.Instructions = "Use the existing browser profile; do not sign in or mutate accounts."
+			client.MCPServers = map[string]MCPServer{
+				"existing-browser": {Command: "/existing/browser-server", Args: []string{"--profile", "existing profile"}},
+			}
+			home := filepath.Join(t.TempDir(), "existing-codex-home")
+			t.Setenv("CODEX_HOME", home)
+			capture := filepath.Join(t.TempDir(), "capture.json")
+			t.Setenv("CODEX_TEST_CAPTURE", capture)
+			var baseline []string
+			for _, policy := range []ExecutionPolicy{"", ExecutionReadOnly, ExecutionWorkspaceWrite} {
+				client.ExecutionPolicy = policy
+				result, err := client.Run(context.Background(), session, "Read a public page only.")
+				if err != nil || result != (Result{SessionID: testSession, Text: "final answer"}) {
+					t.Fatalf("Run = %+v, %v", result, err)
+				}
+				var captured struct {
+					Args                   []string
+					Dir, CodexHome, Prompt string
+				}
+				data, err := os.ReadFile(capture)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := json.Unmarshal(data, &captured); err != nil {
+					t.Fatal(err)
+				}
+				if captured.CodexHome != home || captured.Dir != client.WorkDir || captured.Prompt != "Read a public page only." {
+					t.Fatalf("browser environment changed: %+v", captured)
+				}
+				for i, arg := range captured.Args {
+					if arg == `sandbox_mode="workspace-write"` {
+						captured.Args[i] = `sandbox_mode="read-only"`
+					}
+				}
+				if baseline == nil {
+					baseline = captured.Args
+				} else if !reflect.DeepEqual(captured.Args, baseline) {
+					t.Fatalf("policy changed browser invocation: %q; baseline %q", captured.Args, baseline)
+				}
 			}
 		})
 	}
