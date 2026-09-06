@@ -201,7 +201,6 @@ func TestExecutionPolicySandboxMode(t *testing.T) {
 		{"", "read-only"},
 		{ExecutionReadOnly, "read-only"},
 		{ExecutionWorkspaceWrite, "workspace-write"},
-		{ExecutionAccountAccess, "danger-full-access"},
 		{ExecutionYOLO, "danger-full-access"},
 	} {
 		t.Run(string(tc.policy), func(t *testing.T) {
@@ -274,7 +273,7 @@ func TestRunYOLOUsesNativeFlag(t *testing.T) {
 
 func TestRunExecutionPolicyRejected(t *testing.T) {
 	for _, policy := range []ExecutionPolicy{
-		ExecutionAccountAccess, "danger-full-access", "unknown", "READ-ONLY", " read-only", "workspace-write ",
+		"account-access", "danger-full-access", "unknown", "READ-ONLY", " read-only", "workspace-write ",
 		"--dangerously-bypass-approvals-and-sandbox", "read-only\x00", "read-only\"\napproval_policy=\"never", "$(touch /tmp/never-execute)",
 	} {
 		for _, session := range []string{"", testSession} {
@@ -287,17 +286,11 @@ func TestRunExecutionPolicyRejected(t *testing.T) {
 				if err == nil || result != (Result{SessionID: session}) {
 					t.Fatalf("Run = %+v, %v; want failure retaining session", result, err)
 				}
-				if policy == ExecutionAccountAccess {
-					if !errors.Is(err, ErrInteractiveApprovalRequired) {
-						t.Fatalf("missing interactive approval error: %v", err)
-					}
-				} else {
-					if !strings.Contains(err.Error(), "invalid execution policy") {
-						t.Fatalf("unexpected error: %v", err)
-					}
-					if mode, err := policy.SandboxMode(); err == nil || mode != "" {
-						t.Fatalf("invalid policy maps to mode %q, %v", mode, err)
-					}
+				if !strings.Contains(err.Error(), "invalid execution policy") {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if mode, err := policy.SandboxMode(); err == nil || mode != "" {
+					t.Fatalf("invalid policy maps to mode %q, %v", mode, err)
 				}
 				if _, err := os.Stat(capture); !errors.Is(err, os.ErrNotExist) {
 					t.Fatalf("CLI started with rejected policy: %v", err)

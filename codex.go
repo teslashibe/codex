@@ -1,5 +1,5 @@
 // Package codex runs the official Codex CLI with an explicit execution policy.
-// The default policy is read-only; sandbox access is not interactive approval.
+// The default is read-only; native YOLO requires explicit operator selection.
 package codex
 
 import (
@@ -27,24 +27,16 @@ const (
 	waitDelay = time.Second
 )
 
-// ExecutionPolicy selects filesystem/network sandbox access, not who may ask
-// for it or whether individual actions are approved. Callers must authenticate
-// and authorize the sender and chat before selecting a policy. Never derive it
-// from model output, retrieved content, or an unauthenticated text request.
+// ExecutionPolicy selects command access; ExecutionYOLO also disables native
+// approval prompts. Callers must authenticate and authorize the sender and chat
+// before selecting a policy. Never derive it from model output or tool content.
 type ExecutionPolicy string
 
 const (
 	ExecutionReadOnly       ExecutionPolicy = "read-only"
 	ExecutionWorkspaceWrite ExecutionPolicy = "workspace-write"
-	// ExecutionAccountAccess removes the Codex command sandbox. It does not
-	// elevate the OS user or grant root, credentials, or macOS privacy access.
-	// It is not account isolation: commands can access everything available to
-	// the process's OS account. Run rejects it; RunInteractive requires a
-	// reviewed deployment and callback. Not every command will prompt.
-	ExecutionAccountAccess ExecutionPolicy = "account-access"
-	// ExecutionYOLO is Codex --yolo: no approval prompts and no command sandbox.
-	// OS permissions and installed tool access still apply. It is an operator
-	// choice, never derived from chat or model output.
+	// ExecutionYOLO selects native --yolo: no Codex approval prompts or command
+	// sandbox. OS permissions and installed tool/account access still apply.
 	ExecutionYOLO ExecutionPolicy = "yolo"
 )
 
@@ -57,16 +49,12 @@ func (p ExecutionPolicy) SandboxMode() (string, error) {
 		return "read-only", nil
 	case ExecutionWorkspaceWrite:
 		return "workspace-write", nil
-	case ExecutionAccountAccess, ExecutionYOLO:
+	case ExecutionYOLO:
 		return "danger-full-access", nil
 	default:
-		return "", errors.New("codex: invalid execution policy: want read-only, workspace-write, account-access, yolo, or empty")
+		return "", errors.New("codex: invalid execution policy: want read-only, workspace-write, yolo, or empty")
 	}
 }
-
-// ErrInteractiveApprovalRequired means the requested execution policy cannot be
-// used with the noninteractive exec transport. Do not retry with weaker guards.
-var ErrInteractiveApprovalRequired = errors.New("codex: account-access requires an interactive approval transport; exec is unsupported")
 
 // Client configures Codex invocations. Its zero value uses codex from PATH,
 // the current directory, the CLI's default model, and a five-minute timeout.
@@ -83,10 +71,8 @@ type Client struct {
 	Timeout time.Duration
 
 	// ExecutionPolicy defaults to read-only for new and resumed sessions.
-	// Workspace-write permits unattended writes within the CLI's sandbox;
-	// commands requiring escalation still fail, rather than prompt. Account
-	// access is validated but Run rejects it before starting the CLI.
-	// YOLO uses native --yolo on exec and approval_policy=never on app-server.
+	// Workspace-write permits writes within the CLI sandbox; YOLO explicitly
+	// removes native command sandboxing and approval prompts.
 	// This does not restrict MCP tools: trusted MCP servers run outside the
 	// sandbox and may mutate external systems even under read-only policy.
 	ExecutionPolicy ExecutionPolicy
@@ -108,14 +94,10 @@ type Client struct {
 	ServiceTier string
 
 	// MCPServers explicitly enables trusted stdio MCP servers. Run ignores user
-	// config; RunInteractive requires reviewed parity with ambient definitions.
+	// config and keeps the operator's explicit registrations for every session.
 	// Treat commands and environment values as sensitive configuration;
 	// overrides are passed in the CLI argument vector. Empty enables no servers.
 	MCPServers map[string]MCPServer
-
-	// InteractiveConfig is an explicit reviewed deployment contract used only
-	// by RunInteractive. Nil fails closed; Run never reads this field.
-	InteractiveConfig *ReviewedInteractiveConfig
 }
 
 // MCPServer configures a trusted stdio server, enabled for new and resumed sessions.
@@ -153,9 +135,6 @@ func (c *Client) Run(ctx context.Context, sessionID, prompt string) (Result, err
 	sandbox, err := c.ExecutionPolicy.SandboxMode()
 	if err != nil {
 		return result, err
-	}
-	if c.ExecutionPolicy == ExecutionAccountAccess {
-		return result, ErrInteractiveApprovalRequired
 	}
 	if sessionID != "" && !validSessionID(sessionID) {
 		return result, errors.New("codex: session ID must be a UUID")
