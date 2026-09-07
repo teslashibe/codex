@@ -22,7 +22,7 @@ go get github.com/teslashibe/codex
 
 | Component | Supported or tested versions | Notes |
 | --- | --- | --- |
-| Go | 1.22 and newer | CI tests the latest Go 1.22 patch and Go 1.26.5. |
+| Go | 1.22 and newer | CI tests the latest Go 1.22 patch and Go 1.26.6. |
 | OpenAI Codex CLI | 0.153.1 and 0.153.4 tested | Other versions may work, but changes to flags, configuration keys, or JSON events require verification. |
 | macOS and Linux | Supported | Cancellation kills the subprocess group. |
 | Other Go platforms | Builds where the Codex CLI and `os/exec` are available | Cancellation kills only the CLI process, not its descendants. |
