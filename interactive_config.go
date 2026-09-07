@@ -40,7 +40,11 @@ type ReviewedInteractiveConfig struct {
 	CodexHome, WorkDir, Binary, Version string
 	ConfigSHA256, MCPServersSHA256      string
 	DisabledPlugins                     []string
-	Sources                             map[string]string
+	// EnabledPlugins are force-enabled in the same plugins={} override as
+	// DisabledPlugins. A table that lists only disables can replace the
+	// ambient plugin set and drop reviewed tools.
+	EnabledPlugins []string
+	Sources        map[string]string
 	// Bindings pins optional adapter-owned per-run MCP servers. These names
 	// must be absent from both static MCPServers and reviewed ambient config.
 	Bindings map[string]ReviewedMCPBinding
@@ -149,6 +153,22 @@ func InteractiveConfigSources(codexHome, workDir, userHome string) []string {
 	return slices.Compact(paths)
 }
 
+func reviewedPluginIDs(ids []string) ([]string, error) {
+	plugins := slices.Clone(ids)
+	slices.Sort(plugins)
+	for i, name := range plugins {
+		if name == "" || len(name) > 256 || (i > 0 && plugins[i-1] == name) {
+			return nil, configBlocked("invalid reviewed plugin ID")
+		}
+		for _, ch := range name {
+			if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || strings.ContainsRune("_-.@", ch)) {
+				return nil, configBlocked("invalid reviewed plugin ID")
+			}
+		}
+	}
+	return plugins, nil
+}
+
 func configBlocked(reason string) error { return &InteractiveConfigurationError{Reason: reason} }
 func validDigest(s string) bool {
 	b, e := hex.DecodeString(s)
@@ -238,24 +258,41 @@ func (c *Client) validateInteractiveConfig(ctx context.Context) ([]string, error
 	if err := checkReviewedFile(configPath, r.ConfigSHA256); err != nil {
 		return nil, err
 	}
-	plugins := slices.Clone(r.DisabledPlugins)
-	slices.Sort(plugins)
-	if len(plugins) > 128 {
+	disabled, err := reviewedPluginIDs(r.DisabledPlugins)
+	if err != nil {
+		return nil, err
+	}
+	enabled, err := reviewedPluginIDs(r.EnabledPlugins)
+	if err != nil {
+		return nil, err
+	}
+	if len(disabled)+len(enabled) > 128 {
 		return nil, configBlocked("too many reviewed plugins")
 	}
-	args := []string{"-c", "notify=[]"}
-	pluginEntries := make([]string, 0, len(plugins))
-	for i, name := range plugins {
-		if name == "" || len(name) > 256 || (i > 0 && plugins[i-1] == name) {
-			return nil, configBlocked("invalid reviewed plugin ID")
-		}
-		for _, ch := range name {
-			if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || strings.ContainsRune("_-.@", ch)) {
-				return nil, configBlocked("invalid reviewed plugin ID")
-			}
-		}
-		pluginEntries = append(pluginEntries, tomlString(name)+"={enabled=false}")
+	seen := make(map[string]bool, len(disabled)+len(enabled))
+	for _, name := range disabled {
+		seen[name] = false
 	}
+	for _, name := range enabled {
+		if _, ok := seen[name]; ok {
+			return nil, configBlocked("plugin listed as both enabled and disabled")
+		}
+		seen[name] = true
+	}
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	pluginEntries := make([]string, 0, len(names))
+	for _, name := range names {
+		flag := "false"
+		if seen[name] {
+			flag = "true"
+		}
+		pluginEntries = append(pluginEntries, tomlString(name)+"={enabled="+flag+"}")
+	}
+	args := []string{"-c", "notify=[]"}
 	// CLI override paths use literal split('.'), not TOML key parsing. Quote
 	// plugin IDs inside the TOML value, never in the override path. Recursive
 	// merge retains marketplace metadata while setting each reviewed flag.

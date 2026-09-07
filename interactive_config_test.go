@@ -135,6 +135,23 @@ func TestReviewedInteractiveDrift(t *testing.T) {
 		})
 	}
 }
+func TestReviewedInteractiveEnablesPlugins(t *testing.T) {
+	c := reviewedClient(t, "success")
+	c.InteractiveConfig.EnabledPlugins = []string{"computer-use@bundled"}
+	args, err := c.validateInteractiveConfig(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, `"computer-use@bundled"={enabled=true}`) || !strings.Contains(joined, `"chrome@bundled"={enabled=false}`) {
+		t.Fatalf("plugin flags: %s", joined)
+	}
+	c.InteractiveConfig.EnabledPlugins = []string{"chrome@bundled"}
+	if _, err := c.validateInteractiveConfig(context.Background()); err == nil {
+		t.Fatal("enabled and disabled overlap accepted")
+	}
+}
+
 func TestReviewedInteractiveAllowsRuntimeWorkspace(t *testing.T) {
 	c := reviewedClient(t, "success")
 	runtime := t.TempDir()
