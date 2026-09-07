@@ -76,7 +76,7 @@ func TestReviewedInteractiveRuns(t *testing.T) {
 	}
 }
 func TestReviewedInteractiveDrift(t *testing.T) {
-	for _, name := range []string{"config", "extra-source", "missing-source", "version", "mcp-command", "mcp-env", "plugin-injection", "plugin-duplicate", "home", "workspace", "binary", "fingerprint", "routing-env", "symlink", "new-rule-dir"} {
+	for _, name := range []string{"config", "extra-source", "missing-source", "version", "mcp-command", "mcp-env", "plugin-injection", "plugin-duplicate", "home", "workspace-relative", "binary", "fingerprint", "routing-env", "symlink", "new-rule-dir"} {
 		t.Run(name, func(t *testing.T) {
 			scenario := "success"
 			if name == "version" {
@@ -106,8 +106,8 @@ func TestReviewedInteractiveDrift(t *testing.T) {
 				r.DisabledPlugins = []string{"same", "same"}
 			case "home":
 				t.Setenv("CODEX_HOME", t.TempDir())
-			case "workspace":
-				c.WorkDir = t.TempDir()
+			case "workspace-relative":
+				c.WorkDir = "relative"
 			case "binary":
 				c.Binary = "/different/codex"
 			case "fingerprint":
@@ -135,6 +135,21 @@ func TestReviewedInteractiveDrift(t *testing.T) {
 		})
 	}
 }
+func TestReviewedInteractiveAllowsRuntimeWorkspace(t *testing.T) {
+	c := reviewedClient(t, "success")
+	runtime := t.TempDir()
+	c.WorkDir = runtime
+	capture := filepath.Join(t.TempDir(), "capture")
+	t.Setenv("CODEX_RPC_CAPTURE", capture)
+	result, err := c.RunInteractive(context.Background(), testSession, "reviewed prompt", nil)
+	if err != nil || result != (Result{SessionID: testSession, Text: "interactive answer"}) {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if string(rpcCapture(t, capture)[0]["home"]) != `"`+c.InteractiveConfig.CodexHome+`"` {
+		t.Fatal("home changed")
+	}
+}
+
 func TestReviewedAdditionalSource(t *testing.T) {
 	c := reviewedClient(t, "success")
 	p := filepath.Join(t.TempDir(), "reviewed.plist")

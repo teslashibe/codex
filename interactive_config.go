@@ -29,6 +29,10 @@ import (
 // Review managed-preference plist contents for absence of config/requirements
 // payloads before pinning their hashes. Never put authentication files here.
 //
+// WorkDir is the reviewed workspace used for source hashing. The client may
+// run with a different absolute WorkDir (extra code access on one DM) without
+// changing home, binary, or the hashed sources.
+//
 // Validation is a drift check, not protection against concurrent edits by the
 // same OS user. Keep configuration stable during a run. No home or config files
 // are written; explicit per-plugin disable and notify=[] overrides are ephemeral.
@@ -182,8 +186,13 @@ func (c *Client) validateInteractiveConfig(ctx context.Context) ([]string, error
 			return nil, configBlocked("reviewed paths must be absolute and clean")
 		}
 	}
-	if os.Getenv("CODEX_HOME") != r.CodexHome || c.WorkDir != r.WorkDir || c.Binary != r.Binary {
-		return nil, configBlocked("home, workspace or binary changed")
+	if os.Getenv("CODEX_HOME") != r.CodexHome || c.Binary != r.Binary {
+		return nil, configBlocked("home or binary changed")
+	}
+	// Runtime WorkDir may differ from the reviewed workspace (a DM with
+	// extra code access). Source hashing still uses r.WorkDir.
+	if !filepath.IsAbs(c.WorkDir) || filepath.Clean(c.WorkDir) != c.WorkDir {
+		return nil, configBlocked("workspace must be absolute and clean")
 	}
 	if r.Version != "0.153.1" && r.Version != "0.153.4" {
 		return nil, configBlocked("unsupported reviewed Codex version")
