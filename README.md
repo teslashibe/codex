@@ -4,19 +4,30 @@ A Go client for running the official [OpenAI Codex CLI](https://github.com/opena
 
 [agent-go](https://github.com/teslashibe/agent-go) uses this package as its Codex execution adapter. The package can also be used independently; it does not implement the agent-go application, a model API client, or a standalone command.
 
+This repository is an independent Go adapter. It is not the OpenAI Codex CLI, is not maintained by OpenAI, and does not replace installing or authenticating the CLI.
+
 ## Requirements and installation
 
 - Go 1.22 or newer, as declared in `go.mod`.
 - An installed, authenticated Codex CLI for real invocations. Authentication and session storage remain managed by the CLI through `CODEX_HOME`.
 - A CLI version supporting the flags used in `codex.go`, including `--ignore-user-config` and `--ignore-rules`. Source comments document policy/output-schema behavior against Codex 0.153.1 and 0.153.4; other versions require compatibility verification.
 
-With repository access and Git authentication configured, add the module from your application's Go module:
+Add the module from your application's Go module:
 
 ```sh
-GOPRIVATE=github.com/teslashibe/codex go get github.com/teslashibe/codex
+go get github.com/teslashibe/codex
 ```
 
-The repository is private; the module path does not imply anonymous access or a published release. If you already configure `GOPRIVATE`, include this module alongside your existing patterns.
+## Compatibility
+
+| Component | Supported or tested versions | Notes |
+| --- | --- | --- |
+| Go | 1.22 and newer | CI tests the latest Go 1.22 patch and Go 1.26.6. |
+| OpenAI Codex CLI | 0.153.1 and 0.153.4 tested | Other versions may work, but changes to flags, configuration keys, or JSON events require verification. |
+| macOS and Linux | Supported | Cancellation kills the subprocess group. |
+| Other Go platforms | Builds where the Codex CLI and `os/exec` are available | Cancellation kills only the CLI process, not its descendants. |
+
+Library compatibility does not guarantee that every model, service tier, sandbox, or CLI feature is available. Those capabilities depend on the installed Codex CLI and the authenticated account.
 
 ## Usage
 
