@@ -70,6 +70,11 @@ type Client struct {
 	Model   string
 	Timeout time.Duration
 
+	// Home selects an absolute CODEX_HOME for this client's child process only.
+	// Empty inherits the environment/default. It does not copy credentials or
+	// sessions, and a configured executable can override its own environment.
+	Home string
+
 	// ExecutionPolicy defaults to read-only for new and resumed sessions.
 	// Workspace-write permits writes within the CLI sandbox; YOLO explicitly
 	// removes native command sandboxing and approval prompts.
@@ -132,6 +137,9 @@ type Result struct {
 // retain the session ID and reconcile uncertain effects before retrying.
 func (c *Client) Run(ctx context.Context, sessionID, prompt string) (Result, error) {
 	result := Result{SessionID: sessionID}
+	if c.Home != "" && (!filepath.IsAbs(c.Home) || strings.ContainsRune(c.Home, 0)) {
+		return result, errors.New("codex: home must be an absolute path without NUL bytes")
+	}
 	sandbox, err := c.ExecutionPolicy.SandboxMode()
 	if err != nil {
 		return result, err
@@ -238,6 +246,11 @@ func (c *Client) Run(ctx context.Context, sessionID, prompt string) (Result, err
 
 	cmd := exec.CommandContext(runCtx, binary, args...)
 	cmd.Dir = dir
+	if c.Home != "" {
+		cmd.Env = append(slices.DeleteFunc(os.Environ(), func(value string) bool {
+			return strings.HasPrefix(value, "CODEX_HOME=")
+		}), "CODEX_HOME="+c.Home)
+	}
 	cmd.Stdin = strings.NewReader(prompt)
 	cmd.WaitDelay = waitDelay
 	cleanup := configureProcessCleanup(cmd)
