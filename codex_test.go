@@ -61,6 +61,10 @@ func TestMain(m *testing.M) {
 		}
 		fmt.Print(startedEvent)
 		switch scenario {
+		case "home":
+			data, _ := json.Marshal(map[string]any{"type": "item.completed", "item": map[string]string{"type": "agent_message", "text": os.Getenv("CODEX_HOME")}})
+			fmt.Println(string(data))
+			fmt.Print(completedEvent)
 		case "success":
 			fmt.Println(`{"type":"item.completed","item":{"type":"agent_message","text":"working..."}}`)
 			fmt.Println(`{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"secret tool output"}}`)
@@ -114,6 +118,46 @@ func fakeClient(t *testing.T, scenario string) *Client {
 	// Avoid the race runtime's default one-second sleep in each helper process.
 	t.Setenv("GORACE", "atexit_sleep_ms=0")
 	return &Client{Binary: binary, WorkDir: t.TempDir(), Timeout: 5 * time.Second}
+}
+
+func TestClientHomeIsolation(t *testing.T) {
+	client := fakeClient(t, "home")
+	inherited := filepath.Join(t.TempDir(), "inherited")
+	t.Setenv("CODEX_HOME", inherited)
+	homes := []string{filepath.Join(t.TempDir(), "one $dollar `literal`"), filepath.Join(t.TempDir(), "two with spaces")}
+	type outcome struct {
+		home string
+		got  Result
+		err  error
+	}
+	results := make(chan outcome, len(homes))
+	for _, home := range homes {
+		c := *client
+		c.Home = home
+		go func() {
+			got, err := c.Run(context.Background(), "", "test")
+			results <- outcome{c.Home, got, err}
+		}()
+	}
+	for range homes {
+		result := <-results
+		if result.err != nil || result.got.Text != result.home {
+			t.Fatalf("child home: got %q, want %q, error %v", result.got.Text, result.home, result.err)
+		}
+	}
+	if got := os.Getenv("CODEX_HOME"); got != inherited {
+		t.Fatalf("parent home changed: %q", got)
+	}
+	got, err := client.Run(context.Background(), "", "test")
+	if err != nil || got.Text != inherited {
+		t.Fatalf("empty Home did not inherit: %q, %v", got.Text, err)
+	}
+	for _, home := range []string{"relative", "/invalid\x00home"} {
+		client.Home = home
+		if _, err := client.Run(context.Background(), "", "test"); err == nil {
+			t.Fatalf("accepted invalid home %q", home)
+		}
+	}
 }
 
 func TestRun(t *testing.T) {
